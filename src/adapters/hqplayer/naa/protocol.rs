@@ -213,6 +213,19 @@ fn keepalive(stream: &TcpStream) -> io::Result<()> {
     socket.set_tcp_keepalive(&keepalive)
 }
 
+fn start_sample_bytes(stream: &str, bits: usize) -> io::Result<usize> {
+    match (stream, bits) {
+        ("dsd", 1) => Ok(1),
+        // DoP carries raw interleaved DSD bytes on the NAA wire. Its advertised
+        // PCM carrier width must not change the frame accounting here.
+        ("dop", 24) => Ok(1),
+        ("pcm", 8 | 16 | 24 | 32 | 64) => Ok(bits / 8),
+        _ => Err(invalid(
+            "unqualified stream framing; only PCM 8/16/24/32/64, DoP24, and native DSD supported",
+        )),
+    }
+}
+
 /// Run one relay session to completion and release its reservation exactly once.
 pub fn serve(client: TcpStream, relay: Arc<RelayCore>, id: u64, route: HqpOutputRoute) {
     // A panic must still release the exclusive session, otherwise every later HQPlayer connection
@@ -390,15 +403,7 @@ fn upstream_loop(
                     .and_then(|v| v.parse::<usize>().ok())
                     .ok_or_else(|| invalid("start has no valid bits"))?;
                 injected_metadata = None;
-                sample_bytes = Some(match (stream, bits) {
-                    ("dsd", 1) => 1,
-                    ("pcm", 8 | 16 | 24 | 32 | 64) => bits / 8,
-                    _ => {
-                        return Err(invalid(
-                            "unqualified stream framing; only PCM 8/16/24/32/64 and native DSD supported",
-                        ))
-                    }
-                });
+                sample_bytes = Some(start_sample_bytes(stream, bits)?);
             }
             let rewritten = apply(&raw, edits)?;
             // Reset before sending: a quick reply must not race this reset.
@@ -609,6 +614,78 @@ fn downstream_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn dop_start_uses_raw_dsd_sample_width() {
+        assert_eq!(start_sample_bytes("dop", 24).unwrap(), 1);
+        assert!(start_sample_bytes("dop", 32).is_err());
+        assert!(start_sample_bytes("pcm", 24).is_ok());
+    }
+
+    #[test]
+    fn upstream_loop_forwards_dop_start_and_raw_payload_without_auth() {
+        let relay = super::super::relay::NaaRelay::new(
+            super::super::outputs::NaaRelaySettings::default(),
+            None,
+        )
+        .unwrap();
+        let core = relay.core_for_test();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let upstream = TcpStream::connect(upstream_address).unwrap();
+        let (mut input, _) = upstream_listener.accept().unwrap();
+        let downstream_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let downstream_address = downstream_listener.local_addr().unwrap();
+        let downstream = TcpStream::connect(downstream_address).unwrap();
+        let (mut forwarded, _) = downstream_listener.accept().unwrap();
+        input
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        input
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        forwarded
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = thread::spawn(move || {
+            let mut reader = BufReader::new(upstream);
+            let device = Mutex::new(String::new());
+            upstream_loop(
+                &mut reader,
+                &mut downstream.try_clone().unwrap(),
+                &core,
+                1,
+                &device,
+                super::super::outputs::VIRTUAL_DEVICE_ID,
+            )
+        });
+        input
+            .write_all(b"<networkaudio><operation type=\"start\" stream=\"dop\" rate=\"176400\" bits=\"24\" channels=\"2\"/></networkaudio>\n")
+            .unwrap();
+        let mut header = [0u8; 32];
+        header[4..8].copy_from_slice(&1u32.to_le_bytes());
+        input.write_all(&header).unwrap();
+        input.write_all(&[0x5a]).unwrap();
+        input.shutdown(Shutdown::Write).unwrap();
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while !line.ends_with(b"\n") {
+            forwarded.read_exact(&mut byte).unwrap();
+            line.push(byte[0]);
+        }
+        assert_eq!(
+            line,
+            b"<networkaudio><operation type=\"start\" stream=\"dop\" rate=\"176400\" bits=\"24\" channels=\"2\"/></networkaudio>\n"
+        );
+        let mut body = [0u8; 33];
+        forwarded.read_exact(&mut body).unwrap();
+        assert_eq!(&body[..32], &header);
+        assert_eq!(body[32], 0x5a);
+        assert!(worker.join().unwrap().is_err());
+    }
 
     #[test]
     fn binary_record_starting_with_angle_bracket_is_not_control() {
