@@ -213,6 +213,19 @@ fn keepalive(stream: &TcpStream) -> io::Result<()> {
     socket.set_tcp_keepalive(&keepalive)
 }
 
+fn start_sample_bytes(stream: &str, bits: usize) -> io::Result<usize> {
+    match (stream, bits) {
+        ("dsd", 1) => Ok(1),
+        // DoP carries raw interleaved DSD bytes on the NAA wire. Its advertised
+        // PCM carrier width must not change the frame accounting here.
+        ("dop", 24) => Ok(1),
+        ("pcm", 8 | 16 | 24 | 32 | 64) => Ok(bits / 8),
+        _ => Err(invalid(
+            "unqualified stream framing; only PCM 8/16/24/32/64, DoP24, and native DSD supported",
+        )),
+    }
+}
+
 /// Run one relay session to completion and release its reservation exactly once.
 pub fn serve(client: TcpStream, relay: Arc<RelayCore>, id: u64, route: HqpOutputRoute) {
     // A panic must still release the exclusive session, otherwise every later HQPlayer connection
@@ -390,15 +403,7 @@ fn upstream_loop(
                     .and_then(|v| v.parse::<usize>().ok())
                     .ok_or_else(|| invalid("start has no valid bits"))?;
                 injected_metadata = None;
-                sample_bytes = Some(match (stream, bits) {
-                    ("dsd", 1) => 1,
-                    ("pcm", 8 | 16 | 24 | 32 | 64) => bits / 8,
-                    _ => {
-                        return Err(invalid(
-                            "unqualified stream framing; only PCM 8/16/24/32/64 and native DSD supported",
-                        ))
-                    }
-                });
+                sample_bytes = Some(start_sample_bytes(stream, bits)?);
             }
             let rewritten = apply(&raw, edits)?;
             // Reset before sending: a quick reply must not race this reset.
@@ -609,6 +614,13 @@ fn downstream_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dop_start_uses_raw_dsd_sample_width() {
+        assert_eq!(start_sample_bytes("dop", 24).unwrap(), 1);
+        assert!(start_sample_bytes("dop", 32).is_err());
+        assert!(start_sample_bytes("pcm", 24).is_ok());
+    }
 
     #[test]
     fn binary_record_starting_with_angle_bracket_is_not_control() {
