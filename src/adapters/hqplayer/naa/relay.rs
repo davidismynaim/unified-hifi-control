@@ -221,6 +221,11 @@ pub struct NaaRelay {
 }
 
 impl NaaRelay {
+    #[cfg(test)]
+    pub(super) fn core_for_test(&self) -> Arc<RelayCore> {
+        self.core.clone()
+    }
+
     /// Update the effective metadata projection used by active sessions.
     pub fn set_metadata(&self, metadata: Option<super::frame::MetadataPayload>) {
         self.core.set_metadata(metadata);
