@@ -230,6 +230,24 @@ pub struct NowPlayingResponse {
     pub zones: Vec<ZoneInfo>,
     pub config_sha: Option<String>,
     pub zones_sha: Option<String>,
+    /// From `roon-swim-bridge` (a separate process - see its README): the
+    /// track Roon Radio has already picked, read with real lead time before
+    /// the public API would show it. Omitted entirely (not `null`) when
+    /// unknown, matching `bridge_client.c`'s flat-JSON substring parser,
+    /// which treats an absent key as "not available" the same way it
+    /// already does for `image_key`/`config_sha`/`zones_sha`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_track_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_track_artist: Option<String>,
+    /// Decoded from Roon's private `Sooloos.NullDate` wire format - see
+    /// `roon_swim::RoonSwimPayload` for how.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_year: Option<i32>,
+    /// Pre-formatted ("24-bit / 192kHz"), matching how `line1`/`line2`/`line3`
+    /// already ship server-formatted text for the knob to display verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_info: Option<String>,
 }
 
 /// Helper to build zone info list for error responses
@@ -403,6 +421,21 @@ pub async fn knob_now_playing_handler(
         None => "fixed".to_string(),
     };
 
+    let roon_swim = state
+        .mqtt
+        .roon_swim_store()
+        .get(&crate::mqtt::topics::zone_slug(&zone.zone_id))
+        .await;
+    let (next_track_title, next_track_artist, album_year, bit_info) = match &roon_swim {
+        Some(rs) => (
+            rs.next_track_title.clone(),
+            rs.next_track_artist.clone(),
+            rs.release_year,
+            rs.bit_info(),
+        ),
+        None => (None, None, None, None),
+    };
+
     Ok(Json(NowPlayingResponse {
         zone_id: zone.zone_id,
         line1,
@@ -428,6 +461,10 @@ pub async fn knob_now_playing_handler(
         zones: zone_infos.clone(),
         config_sha,
         zones_sha: Some(compute_zones_sha(&zone_infos)),
+        next_track_title,
+        next_track_artist,
+        album_year,
+        bit_info,
     }))
 }
 
