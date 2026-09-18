@@ -11,7 +11,7 @@
 import mqtt, { MqttClient } from 'mqtt';
 import { RoonClient } from './vendor/roon-internal-api/proto/client';
 import { isRef, RoonObject } from './vendor/roon-internal-api/proto/objects';
-import { serverBrokerIdFromUniqueId } from './roon-ids';
+import { serverBrokerIdFromUniqueId, decodeNullDate } from './roon-ids';
 import * as topics from './topics';
 
 const ROON_HOST = requireEnv('ROON_HOST');
@@ -75,21 +75,8 @@ function resolveArtist(roon: RoonClient, track: RoonObject): string | undefined 
   return stripPerformerMarkup(album ? strField(album, '::PerformedBy') : undefined);
 }
 
-/**
- * `AlbumLite::OriginalReleaseDate`/`::ReleaseDate` are typed `Sooloos.NullDate`,
- * a custom 4-byte struct this vendored decoder has no definition for (it
- * falls back to raw bytes). Tried: little/big-endian uint32 as OLE-automation
- * days, Unix days, Unix seconds - none landed on a plausible date for a known
- * album (Jethro Tull "Thick as a Brick", 1972 original / ~2012 remix), and
- * `Library::GetAlbumEditInfo` returned NotFound for a Radio-sourced/streamed
- * album. So: NOT decoded yet. Returns undefined rather than a guessed value -
- * publishing a wrong year is worse than omitting the field. To crack this
- * properly: a real packet capture of the official Roon app browsing a known
- * album (ground truth for the byte layout), same method used to derive the
- * ServerBrokerID.
- */
-function decodeReleaseYear(_raw: unknown): number | undefined {
-  return undefined;
+function decodeReleaseYear(raw: unknown): number | undefined {
+  return decodeNullDate(Buffer.isBuffer(raw) ? raw : undefined)?.year;
 }
 
 // --- MQTT publishing -----------------------------------------------------

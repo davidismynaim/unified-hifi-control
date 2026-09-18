@@ -36,3 +36,33 @@ export function decodeDotNetDateTimeBinary(binary: bigint): Date | undefined {
   const unixMs = (ticks - DOTNET_EPOCH_TO_UNIX_EPOCH_TICKS) / TICKS_PER_MS;
   return new Date(Number(unixMs));
 }
+
+/**
+ * `Sooloos.NullDate` (RoonBase.dll, decompiled with ilspycmd from the
+ * official Windows client's Roon.Broker.Api.dll/RoonBase.dll):
+ *
+ *   public int ToBinary() => (_year << 16) | (_month << 8) | _day;
+ *
+ * The wire does NOT send that as a raw 4-byte int (RemotingUtils.WriteInteger) -
+ * it flex-encodes it, same as every other integer in this protocol (7 bits/byte,
+ * continuation bit on all but the last byte). Confirmed byte-exact against two
+ * independently known release dates (King Crimson "Red" = 1974-10-06, Taylor
+ * Swift "Red (Taylor's Version)" = 2021-11-12) captured live from this Core.
+ */
+export interface NullDate {
+  year: number;
+  month: number; // 0 = unknown
+  day: number; // 0 = unknown
+}
+
+export function decodeNullDate(buf: Buffer | undefined): NullDate | undefined {
+  if (!buf || buf.length === 0) return undefined;
+  let raw = 0;
+  for (const b of buf) {
+    raw = (raw << 7) | (b & 0x7f);
+    if ((b & 0x80) === 0) break;
+  }
+  const year = (raw >>> 16) & 0xffff;
+  if (year === 0) return undefined;
+  return { year, month: (raw >>> 8) & 0xff, day: raw & 0xff };
+}

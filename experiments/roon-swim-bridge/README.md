@@ -59,10 +59,35 @@ change; nothing here writes to UHC's own state topics.
 
 | Var | Meaning | Default |
 |---|---|---|
+| `ROON_HOST` | Core IP | *(required)* |
+| `ROON_CORE_UNIQUE_ID` | Core's SOOD `unique_id` (dashed GUID form); the sidecar derives the handshake's `ServerBrokerID` from it | *(required)* |
 | `MQTT_HOST` | Broker host | *(required)* |
 | `MQTT_PORT` | Broker port | `1883` |
 | `MQTT_USERNAME` / `MQTT_PASSWORD` | Broker auth | *(optional)* |
 | `MQTT_BASE_TOPIC` | Must match UHC's setting | `unified-hifi` |
 | `MQTT_DISCOVERY_PREFIX` | Must match UHC's setting | `homeassistant` |
-| `ROON_HOST` | Core IP (falls back to SOOD discovery if unset) | *(optional)* |
 | `POLL_INTERVAL_MS` | How often to re-check upcoming/current track | `5000` |
+
+No SOOD auto-discovery yet — `ROON_HOST`/`ROON_CORE_UNIQUE_ID` are read once at startup. Worth adding if the Core's IP isn't static on your network; a DHCP reservation sidesteps it for now.
+
+## `Sooloos.NullDate` (release year) — how it was actually solved
+
+The wire value is genuinely opaque at the protocol level (`LengthPrefixed`,
+i.e. "ask the type itself how to decode this"), so no amount of guessing at
+the *outer* remoting protocol was ever going to crack it. What worked:
+decompiling Roon's own official Windows client DLLs with `ilspycmd`
+(`Roon.Broker.Api.dll`, `RoonBase.dll` — Roon's desktop/mobile clients ship
+**unobfuscated** .NET assemblies) turned up the real source:
+
+```csharp
+// RoonBase.dll
+public int ToBinary() => (_year << 16) | (_month << 8) | _day;
+```
+
+That int is then flex-encoded on the wire using the *same* variable-length
+big-endian 7-bit encoding (`src/vendor/.../proto/flex.ts`) used for every
+other integer in this protocol — not the fixed 4-byte form its own
+`RemotingUtils.WriteInteger` would suggest. Confirmed byte-exact against two
+independently known release dates captured live from this Core (King
+Crimson *Red*, 1974-10-06; Taylor Swift *Red (Taylor's Version)*,
+2021-11-12) before trusting it. See `decodeNullDate` in `src/roon-ids.ts`.
