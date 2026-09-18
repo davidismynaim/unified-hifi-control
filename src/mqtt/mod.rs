@@ -35,6 +35,7 @@ pub mod discovery;
 pub mod knob_command;
 pub mod knob_discovery;
 pub mod knob_state;
+pub mod roon_swim;
 pub mod state;
 pub mod topics;
 
@@ -203,6 +204,11 @@ pub struct MqttPublisher {
     /// survive the publisher being reconfigured, and the Supervisor poll
     /// task that writes to it runs whether or not the publisher is on.
     consumer: Arc<ConsumerMonitor>,
+    /// Latest data from the `roon-swim-bridge` sidecar (Radio next-track,
+    /// source format/bit-depth, release year), keyed by zone slug. See
+    /// `roon_swim` module doc for why that data comes in over MQTT from a
+    /// separate process rather than living in this binary.
+    roon_swim: roon_swim::RoonSwimStore,
 }
 
 /// Snapshot of publisher state for the settings API, deliberately excluding
@@ -265,6 +271,7 @@ impl MqttPublisher {
             runtime: Mutex::new(Runtime::default()),
             reliable_commands: std::sync::RwLock::new(None),
             consumer: Arc::new(ConsumerMonitor::new()),
+            roon_swim: roon_swim::RoonSwimStore::new(),
         }
     }
 
@@ -273,6 +280,13 @@ impl MqttPublisher {
     /// place the publisher's event loop records birth announcements.
     pub fn consumer_monitor(&self) -> Arc<ConsumerMonitor> {
         self.consumer.clone()
+    }
+
+    /// Shared handle onto the latest `roon-swim-bridge` data, read by
+    /// `knobs::routes::knob_now_playing_handler` to add next-track/format/
+    /// release-year fields to `/now_playing`.
+    pub fn roon_swim_store(&self) -> roon_swim::RoonSwimStore {
+        self.roon_swim.clone()
     }
 
     /// Attach the reliable command gateway (#529) so inbound HA commands for legacy
@@ -369,6 +383,7 @@ impl MqttPublisher {
             self.base_url_snapshot(),
             connection.clone(),
             self.consumer.clone(),
+            self.roon_swim.clone(),
             shutdown.clone(),
         ));
         let task = RunningTask {
@@ -691,6 +706,15 @@ async fn announce_all_zones(
     if let Err(error) = client.subscribe(command_filter, QoS::AtLeastOnce).await {
         tracing::warn!("MQTT command subscription failed: {error}");
     }
+
+    // roon-swim-bridge (a separate process - see its README) publishes
+    // Radio next-track/format/release-year here; subscribe so `/now_playing`
+    // can surface it. Same per-connection timing as the command filter
+    // above: retained messages arrive immediately on a fresh subscribe.
+    let roon_swim_filter = format!("{}/roon_swim/+/state", record.base_topic);
+    if let Err(error) = client.subscribe(roon_swim_filter, QoS::AtLeastOnce).await {
+        tracing::warn!("MQTT roon_swim subscription failed: {error}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -785,8 +809,22 @@ async fn handle_incoming_publish(
     knobs: &KnobStore,
     zone_slugs: &HashMap<String, String>,
     knob_slugs: &HashMap<String, String>,
+    roon_swim: &roon_swim::RoonSwimStore,
     publish: &rumqttc::Publish,
 ) {
+    if let Some(slug) = roon_swim::parse_state_topic(&record.base_topic, &publish.topic) {
+        match serde_json::from_slice::<roon_swim::RoonSwimPayload>(&publish.payload) {
+            Ok(payload) => roon_swim.update(slug, payload).await,
+            Err(error) => {
+                // The sidecar is a separate, unversioned-protocol process
+                // (see its README) - a payload we cannot parse is treated
+                // as absence of data, never a reason to fail loudly here.
+                tracing::debug!(slug, %error, "unparseable roon_swim payload; ignoring");
+            }
+        }
+        return;
+    }
+
     if let Some((slug, action)) =
         knob_command::parse_command_topic(&record.base_topic, &publish.topic)
     {
@@ -860,6 +898,7 @@ async fn run(
     base_url: String,
     connection: Arc<ConnectionMonitor>,
     consumer: Arc<ConsumerMonitor>,
+    roon_swim: roon_swim::RoonSwimStore,
     shutdown: CancellationToken,
 ) {
     let availability_topic = topics::availability_topic(&record.base_topic);
@@ -988,6 +1027,7 @@ async fn run(
                             &knobs,
                             &zone_slugs,
                             &knob_slugs,
+                            &roon_swim,
                             &publish,
                         )
                         .await;
