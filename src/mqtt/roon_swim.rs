@@ -12,16 +12,33 @@
 //! panic.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use tokio::sync::RwLock;
+
+/// A payload older than this is treated as unknown. The sidecar re-publishes
+/// every zone each poll cycle (~15-40s), so this tolerates a slow cycle but
+/// not a dead sidecar whose retained messages are still sitting on the broker.
+pub const MAX_PAYLOAD_AGE: Duration = Duration::from_secs(90);
 
 /// One zone's latest payload from the sidecar. All fields optional/lossy by
 /// design - the sidecar publishes `null` rather than a guessed value for
 /// anything it could not resolve that poll cycle.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 pub struct RoonSwimPayload {
+    /// Title of the track this payload was computed for. Compared against the
+    /// zone's current track so a pick computed for the previous track is
+    /// discarded after a track change.
+    pub current_title: Option<String>,
+    /// "queue" (ordinary next item) or "radio" (Roon Radio's pick).
+    pub next_source: Option<String>,
+    /// Sidecar positively established that nothing is coming next (queue
+    /// exhausted and Radio off). Absent/false means "unknown", never "nothing".
+    #[serde(default)]
+    pub next_none: bool,
     pub next_track_title: Option<String>,
     pub next_track_artist: Option<String>,
     pub format: Option<String>,
@@ -32,7 +49,46 @@ pub struct RoonSwimPayload {
     pub updated_at: Option<String>,
 }
 
+/// What `/now_playing` may add for one zone. Every field is independently
+/// optional: absent means unknown, and the knob hides that row.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NowPlayingExtras {
+    pub next_track_title: Option<String>,
+    pub next_track_artist: Option<String>,
+    pub next_track_none: bool,
+    pub album_year: Option<i32>,
+    pub bit_info: Option<String>,
+}
+
 impl RoonSwimPayload {
+    /// Decide what to surface for a zone currently playing `now_playing_title`.
+    ///
+    /// A payload computed for a different track is dropped entirely (it
+    /// describes the previous track's album/format/next pick). "Nothing"
+    /// (`next_track_none`) is only ever emitted on the sidecar's positive
+    /// evidence, and a concrete next track always wins over it.
+    pub fn extras_for(&self, now_playing_title: &str) -> NowPlayingExtras {
+        let same_track = self
+            .current_title
+            .as_deref()
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case(now_playing_title.trim()));
+        if !same_track {
+            return NowPlayingExtras::default();
+        }
+        let has_next = self.next_track_title.as_deref().is_some_and(|t| !t.is_empty());
+        NowPlayingExtras {
+            next_track_title: self.next_track_title.clone().filter(|t| !t.is_empty()),
+            next_track_artist: if has_next {
+                self.next_track_artist.clone().filter(|a| !a.is_empty())
+            } else {
+                None
+            },
+            next_track_none: !has_next && self.next_none,
+            album_year: self.release_year.filter(|y| *y > 0),
+            bit_info: self.bit_info(),
+        }
+    }
+
     /// `"24-bit / 192kHz"` style, matching what the knob firmware's
     /// `ui_set_bit_info` expects to display verbatim. `None` when either
     /// half is unknown, so the caller can hide the row entirely rather than
@@ -63,13 +119,25 @@ pub fn parse_state_topic<'a>(base_topic: &str, topic: &'a str) -> Option<&'a str
     Some(slug)
 }
 
+/// `<base_topic>/roon_swim_bridge/status` - the sidecar's retained last-will
+/// availability topic (`online` / `offline`).
+pub fn is_status_topic(base_topic: &str, topic: &str) -> bool {
+    topic
+        .strip_prefix(base_topic)
+        .and_then(|rest| rest.strip_prefix("/roon_swim_bridge/status"))
+        .is_some_and(str::is_empty)
+}
+
 /// Latest known payload per zone slug (see `topics::zone_slug`). Keyed by
 /// slug rather than zone id so lookups from either side (an inbound MQTT
 /// topic, or a `Zone` about to be rendered) use the exact same derivation
 /// with no separate reverse-mapping table to keep in sync.
 #[derive(Clone, Default)]
 pub struct RoonSwimStore {
-    inner: Arc<RwLock<HashMap<String, RoonSwimPayload>>>,
+    inner: Arc<RwLock<HashMap<String, (RoonSwimPayload, Instant)>>>,
+    /// From the sidecar's retained last-will status topic. Starts false: until
+    /// the broker says the sidecar is online we do not trust retained state.
+    online: Arc<AtomicBool>,
 }
 
 impl RoonSwimStore {
@@ -81,11 +149,22 @@ impl RoonSwimStore {
         self.inner
             .write()
             .await
-            .insert(slug.to_string(), payload);
+            .insert(slug.to_string(), (payload, Instant::now()));
     }
 
-    pub async fn get(&self, slug: &str) -> Option<RoonSwimPayload> {
-        self.inner.read().await.get(slug).cloned()
+    pub fn set_online(&self, online: bool) {
+        self.online.store(online, Ordering::Relaxed);
+    }
+
+    /// The zone's payload, only if the sidecar is currently online and the
+    /// payload arrived within `max_age`. Otherwise `None` (unknown).
+    pub async fn get_fresh(&self, slug: &str, max_age: Duration) -> Option<RoonSwimPayload> {
+        if !self.online.load(Ordering::Relaxed) {
+            return None;
+        }
+        let map = self.inner.read().await;
+        let (payload, at) = map.get(slug)?;
+        (at.elapsed() <= max_age).then(|| payload.clone())
     }
 }
 
@@ -130,6 +209,85 @@ mod tests {
         let mut p = RoonSwimPayload::default();
         p.bit_depth = Some(24);
         assert_eq!(p.bit_info(), None);
+    }
+
+    fn payload(current: &str) -> RoonSwimPayload {
+        RoonSwimPayload {
+            current_title: Some(current.into()),
+            bit_depth: Some(24),
+            sample_rate: Some(96_000),
+            release_year: Some(1977),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn payload_for_a_different_track_is_dropped_entirely() {
+        let mut p = payload("Dreams");
+        p.next_track_title = Some("Go Your Own Way".into());
+        assert_eq!(p.extras_for("Something Else"), NowPlayingExtras::default());
+    }
+
+    #[test]
+    fn matching_track_surfaces_everything_known() {
+        let mut p = payload("Dreams");
+        p.next_track_title = Some("Go Your Own Way".into());
+        p.next_track_artist = Some("Fleetwood Mac".into());
+        let e = p.extras_for(" dreams ");
+        assert_eq!(e.next_track_title.as_deref(), Some("Go Your Own Way"));
+        assert_eq!(e.next_track_artist.as_deref(), Some("Fleetwood Mac"));
+        assert!(!e.next_track_none);
+        assert_eq!(e.album_year, Some(1977));
+        assert_eq!(e.bit_info.as_deref(), Some("24-bit / 96kHz"));
+    }
+
+    #[test]
+    fn nothing_only_on_positive_evidence_and_a_track_beats_it() {
+        let mut p = payload("Dreams");
+        assert!(!p.extras_for("Dreams").next_track_none, "unknown is not nothing");
+        p.next_none = true;
+        assert!(p.extras_for("Dreams").next_track_none);
+        p.next_track_title = Some("Go Your Own Way".into());
+        let e = p.extras_for("Dreams");
+        assert!(!e.next_track_none, "a concrete next track wins over the flag");
+        assert!(e.next_track_title.is_some());
+    }
+
+    #[test]
+    fn artist_without_a_title_is_never_emitted() {
+        let mut p = payload("Dreams");
+        p.next_track_artist = Some("Fleetwood Mac".into());
+        assert_eq!(p.extras_for("Dreams").next_track_artist, None);
+    }
+
+    #[test]
+    fn unknown_year_and_bit_info_are_omitted_independently() {
+        let mut p = payload("Dreams");
+        p.release_year = Some(0);
+        p.bit_depth = None;
+        let e = p.extras_for("Dreams");
+        assert_eq!(e.album_year, None);
+        assert_eq!(e.bit_info, None);
+    }
+
+    #[test]
+    fn status_topic_matching_is_exact() {
+        assert!(is_status_topic("unified-hifi", "unified-hifi/roon_swim_bridge/status"));
+        assert!(!is_status_topic("unified-hifi", "unified-hifi/roon_swim_bridge/status/x"));
+        assert!(!is_status_topic("unified-hifi", "unified-hifi/bridge/status"));
+    }
+
+    #[tokio::test]
+    async fn stale_or_offline_data_is_unknown() {
+        let store = RoonSwimStore::new();
+        store.update("z", payload("Dreams")).await;
+        assert!(store.get_fresh("z", Duration::from_secs(60)).await.is_none(), "offline until told otherwise");
+        store.set_online(true);
+        assert!(store.get_fresh("z", Duration::from_secs(60)).await.is_some());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(store.get_fresh("z", Duration::from_millis(5)).await.is_none(), "old payload is stale");
+        store.set_online(false);
+        assert!(store.get_fresh("z", Duration::from_secs(60)).await.is_none(), "sidecar died");
     }
 
     #[test]

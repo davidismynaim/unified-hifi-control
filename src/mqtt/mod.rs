@@ -715,6 +715,12 @@ async fn announce_all_zones(
     if let Err(error) = client.subscribe(roon_swim_filter, QoS::AtLeastOnce).await {
         tracing::warn!("MQTT roon_swim subscription failed: {error}");
     }
+    // The sidecar's retained last-will status: `offline` (or a session that
+    // never announced `online`) is what stops us serving stale retained state.
+    let roon_swim_status = format!("{}/roon_swim_bridge/status", record.base_topic);
+    if let Err(error) = client.subscribe(roon_swim_status, QoS::AtLeastOnce).await {
+        tracing::warn!("MQTT roon_swim status subscription failed: {error}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -812,6 +818,11 @@ async fn handle_incoming_publish(
     roon_swim: &roon_swim::RoonSwimStore,
     publish: &rumqttc::Publish,
 ) {
+    if roon_swim::is_status_topic(&record.base_topic, &publish.topic) {
+        roon_swim.set_online(publish.payload.as_ref() == b"online");
+        return;
+    }
+
     if let Some(slug) = roon_swim::parse_state_topic(&record.base_topic, &publish.topic) {
         match serde_json::from_slice::<roon_swim::RoonSwimPayload>(&publish.payload) {
             Ok(payload) => roon_swim.update(slug, payload).await,
