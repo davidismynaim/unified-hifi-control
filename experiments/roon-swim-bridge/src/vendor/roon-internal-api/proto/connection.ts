@@ -34,12 +34,18 @@ export class RoonConnection implements Transport {
   private socket: net.Socket | null = null;
   private dataHandler: (chunk: Buffer) => void = () => {};
   private established = false;
+  private closeHandler: (() => void) | null = null;
   readonly clientBrokerId = crypto.randomBytes(16);
 
   constructor(private opts: ConnectionOptions) {}
 
   onData(handler: (chunk: Buffer) => void): void {
     this.dataHandler = handler;
+  }
+
+  /** LOCAL MODIFICATION (not in upstream): called once if the socket closes after the session is live. */
+  onClose(handler: () => void): void {
+    this.closeHandler = handler;
   }
 
   send(data: Buffer): void {
@@ -61,7 +67,14 @@ export class RoonConnection implements Transport {
         reject(e);
       };
 
-      socket.on('timeout', () => fail(new Error('connection timed out during handshake')));
+      // LOCAL MODIFICATION: the timeout is only for the handshake (see setTimeout(0) below). Upstream
+      // left it armed, so an idle-but-healthy session (nothing playing anywhere for 20s) was torn down.
+      socket.on('timeout', () => {
+        if (!this.established) fail(new Error('connection timed out during handshake'));
+      });
+      socket.on('close', () => {
+        if (this.established) this.closeHandler?.();
+      });
       socket.on('error', fail);
 
       socket.on('connect', () => {
@@ -98,6 +111,8 @@ export class RoonConnection implements Transport {
         // First non-ROON bytes after ConnectRequest == ConnectResponse: remoting is live.
         if (step === 3) {
           this.established = true;
+          socket.setTimeout(0);
+          socket.setKeepAlive(true, 15000); // notice a Core that vanished without closing the socket
           resolve();
           // The ConnectResponse and any trailing bytes belong to the remoting layer.
           this.dataHandler(data);

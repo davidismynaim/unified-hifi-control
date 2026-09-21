@@ -17,6 +17,7 @@ import * as topics from './topics';
 import { radioHasNothingToOffer, ZONE_STATE_STOPPED, chooseLiveZones } from './rules';
 
 const ROON_HOST = requireEnv('ROON_HOST');
+const ROON_PORT = Number(process.env.ROON_PORT ?? 9332);
 const ROON_CORE_UNIQUE_ID = requireEnv('ROON_CORE_UNIQUE_ID');
 const MQTT_HOST = requireEnv('MQTT_HOST');
 const MQTT_PORT = Number(process.env.MQTT_PORT ?? 1883);
@@ -243,13 +244,27 @@ class Publisher {
 
 // --- per-zone polling ------------------------------------------------------
 
+// Consecutive RPC timeouts. pollZone deliberately swallows per-zone failures so one bad lookup
+// cannot stop the others, which meant a dead connection (e.g. the Core was restarted) was never
+// noticed and the sidecar limped along logging timeouts forever. The run loop checks this streak.
+let rpcTimeoutStreak = 0;
+// When the current session came up (0 = not connected). Lets main() tell a session that ran fine
+// for a while and then died (retry quickly) from one that never got established (back off).
+let sessionEstablishedAt = 0;
+const MAX_RPC_TIMEOUT_STREAK = 3;
+
 async function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: NodeJS.Timeout;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms: ${what}`)), ms);
+    timer = setTimeout(() => {
+      rpcTimeoutStreak++;
+      reject(new Error(`timed out after ${ms}ms: ${what}`));
+    }, ms);
   });
   try {
-    return await Promise.race([p, timeout]);
+    const result = await Promise.race([p, timeout]);
+    rpcTimeoutStreak = 0;
+    return result;
   } finally {
     clearTimeout(timer!);
   }
@@ -536,14 +551,31 @@ async function pollZone(roon: RoonClient, zone: RoonObject, publisher: Publisher
 
 async function runOnce(publisher: Publisher): Promise<void> {
   const serverBrokerId = serverBrokerIdFromUniqueId(ROON_CORE_UNIQUE_ID);
-  const roon = new RoonClient({ host: ROON_HOST, serverBrokerId, settleMs: 3000 });
-  log(`connecting to ${ROON_HOST}:9332 ...`);
+  const roon = new RoonClient({ host: ROON_HOST, port: ROON_PORT, serverBrokerId, settleMs: 3000 });
+  rpcTimeoutStreak = 0;
+  sessionEstablishedAt = 0;
+  log(`connecting to ${ROON_HOST}:${ROON_PORT} ...`);
   await withTimeout(roon.connect(), 20000, 'initial connect');
   log('connected.');
+  sessionEstablishedAt = Date.now();
+
+  // Either signal ends this session so main() reconnects with backoff: the socket closed (Core
+  // restarted/stopped), or every recent RPC timed out (connection dead without closing).
+  let closed = false;
+  roon.conn.onClose(() => {
+    closed = true;
+  });
+  const assertAlive = () => {
+    if (closed) throw new Error('connection to the Core closed');
+    if (rpcTimeoutStreak >= MAX_RPC_TIMEOUT_STREAK) {
+      throw new Error(`${rpcTimeoutStreak} consecutive RPC timeouts; treating the connection as dead`);
+    }
+  };
 
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
+      assertAlive();
       const zones = liveZones(roon);
       for (const zone of zones) {
         try {
@@ -551,6 +583,7 @@ async function runOnce(publisher: Publisher): Promise<void> {
         } catch (e) {
           log('pollZone error (continuing):', (e as Error).message);
         }
+        assertAlive();
       }
       await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
     }
@@ -568,6 +601,9 @@ async function main() {
     try {
       await runOnce(publisher);
     } catch (e) {
+      // A session that had been healthy for a while and then died is a fresh problem (Core
+      // restarted): retry quickly instead of inheriting an old backoff.
+      if (sessionEstablishedAt > 0 && Date.now() - sessionEstablishedAt > 30000) backoffMs = 2000;
       log('connection lost/failed:', (e as Error).message, `- retrying in ${backoffMs}ms`);
       await new Promise((r) => setTimeout(r, backoffMs));
       backoffMs = Math.min(backoffMs * 2, maxBackoffMs);
