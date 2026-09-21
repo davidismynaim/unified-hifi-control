@@ -350,19 +350,27 @@ pub async fn knob_now_playing_handler(
 
     // Get zone from aggregator (single source of truth)
     let zone = match state.aggregator.get_zone(&prefixed_zone_id).await {
-        Some(z) => z,
-        None => {
-            let zones_sha = compute_zones_sha(&zone_infos);
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "zone not found",
-                    "error_code": "ZONE_NOT_FOUND",
-                    "zones": zone_infos,
-                    "zones_sha": zones_sha
-                })),
-            ));
+        Some(z) => {
+            crate::knobs::zone_grace::remember(&z);
+            z
         }
+        // Roon removes and re-adds zones on its own, sometimes for tens of seconds; a poll
+        // landing in that gap must not become the knob's "Retry" screen. See `zone_grace`.
+        None => match crate::knobs::zone_grace::recall_recent(&prefixed_zone_id) {
+            Some(z) => z,
+            None => {
+                let zones_sha = compute_zones_sha(&zone_infos);
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "zone not found",
+                        "error_code": "ZONE_NOT_FOUND",
+                        "zones": zone_infos,
+                        "zones_sha": zones_sha
+                    })),
+                ));
+            }
+        },
     };
 
     // Check if zone's adapter is enabled
