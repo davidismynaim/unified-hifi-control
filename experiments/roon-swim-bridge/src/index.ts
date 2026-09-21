@@ -29,6 +29,9 @@ const DISCOVERY_PREFIX = process.env.MQTT_DISCOVERY_PREFIX ?? 'homeassistant';
 // short interval mostly just notices track changes quickly.
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 1500);
 const RADIO_POOL_REFRESH_MS = 30000;
+// An empty pool is usually transient (Radio rebuilds it after a Core restart or a big queue
+// change), so look again soon rather than holding "no pick" for the full refresh period.
+const RADIO_EMPTY_POOL_REFRESH_MS = 5000;
 const HEARTBEAT_MS = 15000;
 const RPC_TIMEOUT_MS = 10000;
 // Diagnostics: set DEBUG_ZONE to (part of) a zone name to log, on every poll, which zone/queue
@@ -489,7 +492,11 @@ async function pollZone(roon: RoonClient, zone: RoonObject, publisher: Publisher
           const itemKey = String(anyField(nowPlayingItem!, '::TransportItemId'));
           let rc = radioNextCache.get(zoneId);
           let definitive = true;
-          if (!rc || rc.key !== itemKey || Date.now() - rc.at > RADIO_POOL_REFRESH_MS) {
+          if (
+            !rc ||
+            rc.key !== itemKey ||
+            Date.now() - rc.at > (rc.next ? RADIO_POOL_REFRESH_MS : RADIO_EMPTY_POOL_REFRESH_MS)
+          ) {
             const lookup = await radioNext(roon, swimRef, zoneName);
             definitive = lookup.definitive;
             rc = { key: itemKey, at: Date.now(), next: lookup.next };
