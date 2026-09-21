@@ -248,6 +248,10 @@ pub struct NowPlayingResponse {
     /// already ship server-formatted text for the knob to display verbatim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bit_info: Option<String>,
+    /// Emitted only (as literal `true`) when the sidecar positively knows
+    /// nothing is coming next; the knob shows "Nothing". Absent means unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_track_none: Option<bool>,
 }
 
 /// Helper to build zone info list for error responses
@@ -421,19 +425,20 @@ pub async fn knob_now_playing_handler(
         None => "fixed".to_string(),
     };
 
-    let roon_swim = state
-        .mqtt
-        .roon_swim_store()
-        .get(&crate::mqtt::topics::zone_slug(&zone.zone_id))
-        .await;
-    let (next_track_title, next_track_artist, album_year, bit_info) = match &roon_swim {
-        Some(rs) => (
-            rs.next_track_title.clone(),
-            rs.next_track_artist.clone(),
-            rs.release_year,
-            rs.bit_info(),
-        ),
-        None => (None, None, None, None),
+    // Sidecar data is only used while it is online and fresh, and only for the
+    // track it was computed for - see `RoonSwimPayload::extras_for`.
+    let extras = match np.map(|n| n.title.as_str()).filter(|t| !t.is_empty()) {
+        Some(title) => state
+            .mqtt
+            .roon_swim_store()
+            .get_fresh(
+                &crate::mqtt::topics::zone_slug(&zone.zone_id),
+                crate::mqtt::roon_swim::MAX_PAYLOAD_AGE,
+            )
+            .await
+            .map(|p| p.extras_for(title))
+            .unwrap_or_default(),
+        None => Default::default(),
     };
 
     Ok(Json(NowPlayingResponse {
@@ -461,10 +466,11 @@ pub async fn knob_now_playing_handler(
         zones: zone_infos.clone(),
         config_sha,
         zones_sha: Some(compute_zones_sha(&zone_infos)),
-        next_track_title,
-        next_track_artist,
-        album_year,
-        bit_info,
+        next_track_title: extras.next_track_title,
+        next_track_artist: extras.next_track_artist,
+        album_year: extras.album_year,
+        bit_info: extras.bit_info,
+        next_track_none: extras.next_track_none.then_some(true),
     }))
 }
 
