@@ -55,6 +55,24 @@ zone — so these show up as three more sensor entities on the HA device UHC
 already created, not a second device. UHC's main binary does not need to
 change; nothing here writes to UHC's own state topics.
 
+## Published payload (`<base_topic>/roon_swim/<zone_slug>/state`, retained)
+
+| Field | Meaning |
+|---|---|
+| `current_title` | Title of the track this payload was computed for. UHC discards the payload if the zone is now playing something else. |
+| `next_track_title` / `next_track_artist` | The zone's next track, or `null`. |
+| `next_source` | `queue` (ordinary next queue item, via `Queue::GetItems`, Roon's own order so shuffle is applied) or `radio` (the first item of *that zone's* `Swim::UpcomingItemsQuery`). |
+| `next_none` | `true` only on positive evidence that nothing is coming; `false` means *unknown*, never "nothing". |
+| `auto_radio`, `queue_remaining` | Zone facts the decision was based on (`queue_remaining` includes the current track). |
+| `format`, `sample_rate`, `bit_depth`, `release_year` | Current track. `null` when unknown. |
+| `updated_at` | Publish time. Every zone is republished each poll cycle, so this doubles as a heartbeat. |
+
+Availability is the retained last-will topic `<base_topic>/roon_swim_bridge/status` (`online`/`offline`).
+
+`UpcomingItemsQuery` returns **only Radio picks**, never ordinary queued tracks (verified live: a zone with 34 tracks queued returned 0), which is why the ordinary queue is read separately. When looping or shuffle is on, "next" is not guessed (published as unknown).
+
+**"Nothing" (`next_none`)** is set when the queue is exhausted and either Radio is off, or Radio is on but has nothing to offer: playback already stopped, or an *active* Radio session has finished recomputing, has no pick, and the track is past a 20 s grace period (`src/rules.ts`, tested with `npm test`). Radio on with no active session, or still recomputing, stays unknown - a pick that has not been computed yet must never read as "Nothing".
+
 ## Config (env vars)
 
 | Var | Meaning | Default |

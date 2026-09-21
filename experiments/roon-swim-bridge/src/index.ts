@@ -11,8 +11,10 @@
 import mqtt, { MqttClient } from 'mqtt';
 import { RoonClient } from './vendor/roon-internal-api/proto/client';
 import { isRef, RoonObject } from './vendor/roon-internal-api/proto/objects';
+import { readFlexInt, readFlexLong } from './vendor/roon-internal-api/proto/flex';
 import { serverBrokerIdFromUniqueId, decodeNullDate } from './roon-ids';
 import * as topics from './topics';
+import { radioHasNothingToOffer, ZONE_STATE_STOPPED } from './rules';
 
 const ROON_HOST = requireEnv('ROON_HOST');
 const ROON_CORE_UNIQUE_ID = requireEnv('ROON_CORE_UNIQUE_ID');
@@ -182,8 +184,13 @@ class Publisher {
     zoneName: string,
     source: string,
     state: {
+      currentTitle?: string;
       nextTrackTitle?: string;
       nextTrackArtist?: string;
+      nextSource?: 'queue' | 'radio';
+      nextNone: boolean;
+      autoRadio: boolean;
+      queueRemaining: number;
       format?: string;
       sampleRate?: number;
       bitDepth?: number;
@@ -196,8 +203,13 @@ class Publisher {
     this.client.publish(
       stateTopic,
       JSON.stringify({
+        current_title: state.currentTitle ?? null,
         next_track_title: state.nextTrackTitle ?? null,
         next_track_artist: state.nextTrackArtist ?? null,
+        next_source: state.nextSource ?? null,
+        next_none: state.nextNone,
+        auto_radio: state.autoRadio,
+        queue_remaining: state.queueRemaining,
         format: state.format ?? null,
         sample_rate: state.sampleRate ?? null,
         bit_depth: state.bitDepth ?? null,
@@ -256,6 +268,89 @@ function resolveZoneName(roon: RoonClient, zone: RoonObject): string | undefined
   return undefined;
 }
 
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** Poll `fn` until it yields a value or `ms` elapses - object pushes from Core
+ * arrive asynchronously after a call returns. */
+async function waitFor<T>(fn: () => T | undefined, ms: number): Promise<T | undefined> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const v = fn();
+    if (v !== undefined) return v;
+    if (Date.now() >= deadline) return undefined;
+    await sleep(100);
+  }
+}
+
+interface NextTrack {
+  title?: string;
+  artist?: string;
+}
+
+async function resolveNext(roon: RoonClient, item: RoonObject): Promise<NextTrack | undefined> {
+  const track = await waitFor(() => resolveTrackFromItem(roon, item), 3000);
+  if (!track) return undefined;
+  return { title: strField(track, '::Title'), artist: resolveArtist(roon, track) };
+}
+
+/**
+ * The zone's OWN Radio pick: the first item of the Query object that this
+ * zone's `Swim::UpcomingItemsQuery` returns. (An earlier version scanned every
+ * TransportItem in the whole graph, so a zone with no Radio picks published
+ * some other zone's.) Only Radio picks live here - ordinary queued tracks do
+ * not, see `queueNext`.
+ */
+async function radioNext(roon: RoonClient, swimRef: bigint, zoneName: string): Promise<NextTrack | undefined> {
+  const res = await withTimeout(
+    roon.call('Swim', 'UpcomingItemsQuery', [{ type: 'ResultCallback<Query<TransportItem>>', name: 'cb' }], Buffer.alloc(0), swimRef),
+    RPC_TIMEOUT_MS,
+    `Swim.UpcomingItemsQuery(zone=${zoneName})`
+  );
+  if (!res.success) return undefined;
+  const [queryOid] = readFlexLong(Uint8Array.from(res.payload), 0);
+  const query = await waitFor(() => roon.graph.getObject(queryOid), 3000);
+  if (!query || Number((query.fields as any).$count ?? 0) === 0) return undefined;
+  const item = await waitFor(() => {
+    const first = (roon.graph.getObject(queryOid)?.fields as any)?.$items?.[0];
+    return first && isRef(first) ? roon.graph.getObject((first as any).$ref) : undefined;
+  }, 3000);
+  return item ? resolveNext(roon, item) : undefined;
+}
+
+/**
+ * The ordinary (non-Radio) queue's next item, via `Queue::GetItems`. The return
+ * value is `flexInt(byteLength) flexInt(count) flexLong(oid)*count` - item
+ * objects are then pushed into the graph. Roon's own order, so shuffle is
+ * already applied. Only called when the queue has items after the current one.
+ */
+async function queueNext(roon: RoonClient, queueRef: bigint, currentIndex: number, zoneName: string): Promise<NextTrack | undefined> {
+  const res = await withTimeout(
+    roon.call('Queue', 'GetItems', [{ type: 'ResultCallback<IList<TransportItem>>', name: 'cb' }], Buffer.alloc(0), queueRef),
+    RPC_TIMEOUT_MS,
+    `Queue.GetItems(zone=${zoneName})`
+  );
+  if (!res.success) return undefined;
+  const bytes = Uint8Array.from(res.payload);
+  const [byteLen, p1] = readFlexInt(bytes, 0);
+  if (byteLen !== bytes.length - p1) return undefined; // unexpected shape: treat as unknown
+  const [count, p2] = readFlexInt(bytes, p1);
+  let pos = p2;
+  const ids: bigint[] = [];
+  for (let i = 0; i < count && pos < bytes.length; i++) {
+    const [oid, np] = readFlexLong(bytes, pos);
+    ids.push(oid);
+    pos = np;
+  }
+  const nextOid = ids[currentIndex + 1];
+  if (nextOid === undefined) return undefined;
+  const item = await waitFor(() => roon.graph.getObject(nextOid), 3000);
+  return item ? resolveNext(roon, item) : undefined;
+}
+
+// Cache of the ordinary-queue next item per zone, keyed by (now-playing item id, queue length):
+// GetItems can be large on a long-lived queue, so only refetch when either changes.
+const queueNextCache = new Map<string, { key: string; next: NextTrack | undefined }>();
+
 async function pollZone(roon: RoonClient, zone: RoonObject, publisher: Publisher) {
   const zoneIdBuf = anyField(zone, '::ZoneId') as Buffer | undefined;
   const zoneId = zoneIdBuf ? `roon:${zoneIdBuf.toString('hex')}` : `roon:oid${zone.oid}`;
@@ -263,18 +358,30 @@ async function pollZone(roon: RoonClient, zone: RoonObject, publisher: Publisher
 
   const nowPlayingRef = refField(zone, '::NowPlaying');
   const swimRef = refField(zone, '::Swim');
+  const queueRef = refField(zone, '::Queue');
+  const queueObj = queueRef !== undefined ? roon.graph.getObject(queueRef) : undefined;
 
+  // Fields Roon omits when they hold their default (sparse serialization).
+  const autoRadio = anyField(zone, '::AutoSwim') === true;
+  const loopOrShuffle = Number(anyField(zone, '::Loop') ?? 0) !== 0 || anyField(zone, '::Shuffle') === true;
+  const queueRemaining = queueObj ? Number(anyField(queueObj, '::TrackCountRemaining') ?? 0) : 0;
+  const queueCount = queueObj ? Number(anyField(queueObj, '::Count') ?? 0) : 0;
+  const currentIndex = queueObj ? Number(anyField(queueObj, '::CurrentItemIndex') ?? -1) : -1;
+
+  let currentTitle: string | undefined;
   let format: string | undefined;
   let sampleRate: number | undefined;
   let bitDepth: number | undefined;
   let releaseYear: number | undefined;
-  let nextTrackTitle: string | undefined;
-  let nextTrackArtist: string | undefined;
+  let next: NextTrack | undefined;
+  let nextSource: 'queue' | 'radio' | undefined;
+  let nextNone = false;
 
   if (nowPlayingRef !== undefined) {
     const nowPlayingItem = roon.graph.getObject(nowPlayingRef);
     const currentTrack = nowPlayingItem ? resolveTrackFromItem(roon, nowPlayingItem) : undefined;
     if (currentTrack) {
+      currentTitle = strField(currentTrack, '::Title');
       format = strField(currentTrack, '::Format');
       sampleRate = intField(currentTrack, '::SampleRate');
       bitDepth = intField(currentTrack, '::BitDepth');
@@ -283,46 +390,53 @@ async function pollZone(roon: RoonClient, zone: RoonObject, publisher: Publisher
       if (album) releaseYear = decodeReleaseYear(anyField(album, '::OriginalReleaseDate'));
     }
 
-    if (swimRef !== undefined) {
+    // "Nothing" needs positive evidence; anything ambiguous stays unknown
+    // (loop/shuffle change what "next" means, so we do not guess).
+    if (currentTrack && !loopOrShuffle) {
       try {
-        const res = await withTimeout(
-          roon.call(
-            'Swim',
-            'UpcomingItemsQuery',
-            [{ type: 'ResultCallback<Query<TransportItem>>', name: 'cb' }],
-            Buffer.alloc(0),
-            swimRef
-          ),
-          RPC_TIMEOUT_MS,
-          `Swim.UpcomingItemsQuery(zone=${zoneName})`
-        );
-        if (res.success) {
-          await new Promise((r) => setTimeout(r, 1500)); // let pushes settle
-          const currentId = anyField(nowPlayingItem!, '::TransportItemId') as bigint | undefined;
-          if (currentId !== undefined) {
-            const candidates = roon.graph
-              .findByType('TransportItem')
-              .filter((o) => anyField(o, '::IsFromSwim') === true)
-              .map((o) => ({ o, id: anyField(o, '::TransportItemId') as bigint }))
-              .filter((x) => x.id > currentId)
-              .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
-            const next = candidates[0]?.o;
-            const nextTrack = next ? resolveTrackFromItem(roon, next) : undefined;
-            if (nextTrack) {
-              nextTrackTitle = strField(nextTrack, '::Title');
-              nextTrackArtist = resolveArtist(roon, nextTrack);
-            }
+        if (queueRemaining > 1 && queueRef !== undefined && currentIndex >= 0) {
+          const key = `${anyField(nowPlayingItem!, '::TransportItemId')}:${queueCount}`;
+          let cached = queueNextCache.get(zoneId);
+          if (!cached || cached.key !== key) {
+            cached = { key, next: await queueNext(roon, queueRef, currentIndex, zoneName) };
+            queueNextCache.set(zoneId, cached);
+          }
+          next = cached.next;
+          if (next) nextSource = 'queue';
+        } else if (!autoRadio) {
+          nextNone = true; // queue exhausted and Radio is off: nothing is coming
+        } else if (swimRef !== undefined) {
+          next = await radioNext(roon, swimRef, zoneName);
+          if (next) {
+            nextSource = 'radio';
+          } else {
+            const swim = roon.graph.getObject(swimRef);
+            const seek = anyField(zone, '::SeekPosition');
+            nextNone = radioHasNothingToOffer({
+              stopped: Number(anyField(zone, '::State') ?? 0) === ZONE_STATE_STOPPED,
+              swimActive: !!swim && anyField(swim, '::SwimStatus') === 'online' && anyField(swim, '::IsEnabled') === true,
+              swimRecomputing: !!swim && anyField(swim, '::IsRecomputing') === true,
+              seekSeconds: seek === undefined || seek === null ? undefined : Number(seek),
+            });
           }
         }
       } catch (e) {
-        log(`UpcomingItemsQuery failed for zone "${zoneName}":`, (e as Error).message);
+        log(`next-track lookup failed for zone "${zoneName}":`, (e as Error).message);
+        next = undefined;
+        nextSource = undefined;
+        nextNone = false;
       }
     }
   }
 
   publisher.publishZoneState(zoneId, zoneName, 'roon', {
-    nextTrackTitle,
-    nextTrackArtist,
+    currentTitle,
+    nextTrackTitle: next?.title,
+    nextTrackArtist: next?.artist,
+    nextSource,
+    nextNone,
+    autoRadio,
+    queueRemaining,
     format,
     sampleRate,
     bitDepth,
