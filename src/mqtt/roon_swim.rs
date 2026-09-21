@@ -75,7 +75,10 @@ impl RoonSwimPayload {
         if !same_track {
             return NowPlayingExtras::default();
         }
-        let has_next = self.next_track_title.as_deref().is_some_and(|t| !t.is_empty());
+        let has_next = self
+            .next_track_title
+            .as_deref()
+            .is_some_and(|t| !t.is_empty());
         NowPlayingExtras {
             next_track_title: self.next_track_title.clone().filter(|t| !t.is_empty()),
             next_track_artist: if has_next {
@@ -183,14 +186,20 @@ mod tests {
     #[test]
     fn rejects_other_topics() {
         assert_eq!(
-            parse_state_topic("unified-hifi", "unified-hifi/media_player/roon_abc123/state"),
+            parse_state_topic(
+                "unified-hifi",
+                "unified-hifi/media_player/roon_abc123/state"
+            ),
             None
         );
         assert_eq!(
             parse_state_topic("unified-hifi", "unified-hifi/roon_swim/roon_abc123/config"),
             None
         );
-        assert_eq!(parse_state_topic("unified-hifi", "unified-hifi/roon_swim//state"), None);
+        assert_eq!(
+            parse_state_topic("unified-hifi", "unified-hifi/roon_swim//state"),
+            None
+        );
     }
 
     #[test]
@@ -244,12 +253,18 @@ mod tests {
     #[test]
     fn nothing_only_on_positive_evidence_and_a_track_beats_it() {
         let mut p = payload("Dreams");
-        assert!(!p.extras_for("Dreams").next_track_none, "unknown is not nothing");
+        assert!(
+            !p.extras_for("Dreams").next_track_none,
+            "unknown is not nothing"
+        );
         p.next_none = true;
         assert!(p.extras_for("Dreams").next_track_none);
         p.next_track_title = Some("Go Your Own Way".into());
         let e = p.extras_for("Dreams");
-        assert!(!e.next_track_none, "a concrete next track wins over the flag");
+        assert!(
+            !e.next_track_none,
+            "a concrete next track wins over the flag"
+        );
         assert!(e.next_track_title.is_some());
     }
 
@@ -272,22 +287,52 @@ mod tests {
 
     #[test]
     fn status_topic_matching_is_exact() {
-        assert!(is_status_topic("unified-hifi", "unified-hifi/roon_swim_bridge/status"));
-        assert!(!is_status_topic("unified-hifi", "unified-hifi/roon_swim_bridge/status/x"));
-        assert!(!is_status_topic("unified-hifi", "unified-hifi/bridge/status"));
+        assert!(is_status_topic(
+            "unified-hifi",
+            "unified-hifi/roon_swim_bridge/status"
+        ));
+        assert!(!is_status_topic(
+            "unified-hifi",
+            "unified-hifi/roon_swim_bridge/status/x"
+        ));
+        assert!(!is_status_topic(
+            "unified-hifi",
+            "unified-hifi/bridge/status"
+        ));
     }
 
     #[tokio::test]
     async fn stale_or_offline_data_is_unknown() {
         let store = RoonSwimStore::new();
         store.update("z", payload("Dreams")).await;
-        assert!(store.get_fresh("z", Duration::from_secs(60)).await.is_none(), "offline until told otherwise");
+        assert!(
+            store
+                .get_fresh("z", Duration::from_secs(60))
+                .await
+                .is_none(),
+            "offline until told otherwise"
+        );
         store.set_online(true);
-        assert!(store.get_fresh("z", Duration::from_secs(60)).await.is_some());
+        assert!(store
+            .get_fresh("z", Duration::from_secs(60))
+            .await
+            .is_some());
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(store.get_fresh("z", Duration::from_millis(5)).await.is_none(), "old payload is stale");
+        assert!(
+            store
+                .get_fresh("z", Duration::from_millis(5))
+                .await
+                .is_none(),
+            "old payload is stale"
+        );
         store.set_online(false);
-        assert!(store.get_fresh("z", Duration::from_secs(60)).await.is_none(), "sidecar died");
+        assert!(
+            store
+                .get_fresh("z", Duration::from_secs(60))
+                .await
+                .is_none(),
+            "sidecar died"
+        );
     }
 
     #[test]
@@ -295,7 +340,10 @@ mod tests {
         let json = r#"{"current_title":"Brothers In Arms (Edit)","next_track_title":"Sussudio (2016 Remaster)","next_track_artist":"Phil Collins","next_source":"radio","next_none":false,"auto_radio":true,"queue_remaining":1,"format":"FLAC 44.1kHz 16bit","sample_rate":44100,"bit_depth":16,"release_year":1998,"updated_at":"2026-09-21T10:16:14.409Z"}"#;
         let p: RoonSwimPayload = serde_json::from_str(json).expect("must parse");
         let e = p.extras_for("Brothers In Arms (Edit)");
-        assert_eq!(e.next_track_title.as_deref(), Some("Sussudio (2016 Remaster)"));
+        assert_eq!(
+            e.next_track_title.as_deref(),
+            Some("Sussudio (2016 Remaster)")
+        );
         assert_eq!(e.album_year, Some(1998));
         assert_eq!(e.bit_info.as_deref(), Some("16-bit / 44.1kHz"));
     }
