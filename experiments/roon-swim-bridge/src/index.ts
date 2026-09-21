@@ -136,12 +136,17 @@ class Publisher {
         'sensor',
         'next_track',
         {
-          name: 'Next Track (Radio)',
+          // Covers the ordinary queue as well as Radio picks. Only the display name
+          // changed: the unique_id (and therefore the registered entity_id) is unchanged.
+          name: 'Next Track',
           unique_id: `uhc_${topics.zoneSlug(zoneId)}_swim_next_track`,
           state_topic: stateTopic,
           value_template: "{{ value_json.next_track_title | default('unknown') }}",
           json_attributes_topic: stateTopic,
-          json_attributes_template: '{{ {"artist": value_json.next_track_artist} | tojson }}',
+          // `none` is true only on positive evidence that nothing is coming (false = unknown);
+          // `source` is "queue" or "radio".
+          json_attributes_template:
+            '{{ {"artist": value_json.next_track_artist, "none": value_json.next_none, "source": value_json.next_source} | tojson }}',
           availability_topic: availabilityTopic,
           device,
         },
