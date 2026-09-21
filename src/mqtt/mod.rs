@@ -71,6 +71,17 @@ pub const DEFAULT_DISCOVERY_PREFIX: &str = "homeassistant";
 pub const DEFAULT_PORT: u16 = 1883;
 pub const DEFAULT_TLS_PORT: u16 = 8883;
 
+/// Capacity of the `rumqttc` request channel between `AsyncClient` and its event loop.
+///
+/// The `ConnAck` handler re-announces every zone and knob (discovery entities plus
+/// state, one awaited `publish` each) *inside* the arm that polls the event loop. While
+/// that handler runs nothing drains the channel, so an announce that queues more requests
+/// than this capacity blocks forever on the next `publish().await`: the loop is never
+/// polled again, pings stop, and the broker drops the client after 1.5x keepalive with no
+/// reconnect. It was 64, which 8 zones plus two subscriptions exceeded. Requests are tiny,
+/// so size for many zones rather than trusting the count to stay small.
+pub const REQUEST_CHANNEL_CAPACITY: usize = 4096;
+
 /// Whether the publisher is actually talking to a broker (#607).
 ///
 /// Deliberately *not* the same question as [`MqttStatus::running`], which
@@ -914,7 +925,7 @@ async fn run(
 ) {
     let availability_topic = topics::availability_topic(&record.base_topic);
     let options = mqtt_options(&record, &availability_topic);
-    let (client, mut eventloop) = AsyncClient::new(options, 64);
+    let (client, mut eventloop) = AsyncClient::new(options, REQUEST_CHANNEL_CAPACITY);
     let mut bus_rx = bus.subscribe();
     let mut zone_slugs: HashMap<String, String> = HashMap::new();
     let mut known_knob_ids: HashSet<String> = HashSet::new();
@@ -1116,5 +1127,21 @@ async fn run(
                 .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod request_channel_tests {
+    use super::REQUEST_CHANNEL_CAPACITY;
+
+    #[test]
+    fn request_channel_is_large_enough_for_a_full_announce() {
+        // A fresh connection queues, per zone, up to ~2 image/sensor + 2 volume/mute + 4
+        // transport-button discovery entries plus a state publish, then knobs and
+        // subscriptions - all awaited from inside the event-loop arm, so if they exceed the
+        // channel the loop deadlocks (see REQUEST_CHANNEL_CAPACITY). Guard a generous fleet.
+        let per_zone = 10;
+        let fixed = 40; // availability, subscriptions, knob entities
+        assert!(REQUEST_CHANNEL_CAPACITY >= 20 * per_zone + fixed);
     }
 }

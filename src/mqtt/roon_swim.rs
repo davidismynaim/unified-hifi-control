@@ -291,6 +291,16 @@ mod tests {
     }
 
     #[test]
+    fn real_radio_zone_payload_from_the_sidecar_is_surfaced() {
+        let json = r#"{"current_title":"Brothers In Arms (Edit)","next_track_title":"Sussudio (2016 Remaster)","next_track_artist":"Phil Collins","next_source":"radio","next_none":false,"auto_radio":true,"queue_remaining":1,"format":"FLAC 44.1kHz 16bit","sample_rate":44100,"bit_depth":16,"release_year":1998,"updated_at":"2026-09-21T10:16:14.409Z"}"#;
+        let p: RoonSwimPayload = serde_json::from_str(json).expect("must parse");
+        let e = p.extras_for("Brothers In Arms (Edit)");
+        assert_eq!(e.next_track_title.as_deref(), Some("Sussudio (2016 Remaster)"));
+        assert_eq!(e.album_year, Some(1998));
+        assert_eq!(e.bit_info.as_deref(), Some("16-bit / 44.1kHz"));
+    }
+
+    #[test]
     fn deserializes_sidecar_payload() {
         let json = r#"{"next_track_title":"Modern Love","next_track_artist":"David Bowie","format":"FLAC 192kHz 24bit","sample_rate":192000,"bit_depth":24,"release_year":1983,"updated_at":"2026-09-18T12:00:00Z"}"#;
         let p: RoonSwimPayload = serde_json::from_str(json).unwrap();
