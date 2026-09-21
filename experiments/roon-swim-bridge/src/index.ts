@@ -14,7 +14,7 @@ import { isRef, RoonObject } from './vendor/roon-internal-api/proto/objects';
 import { readFlexInt, readFlexLong } from './vendor/roon-internal-api/proto/flex';
 import { serverBrokerIdFromUniqueId, decodeNullDate } from './roon-ids';
 import * as topics from './topics';
-import { radioHasNothingToOffer, ZONE_STATE_STOPPED } from './rules';
+import { radioHasNothingToOffer, ZONE_STATE_STOPPED, chooseLiveZones } from './rules';
 
 const ROON_HOST = requireEnv('ROON_HOST');
 const ROON_CORE_UNIQUE_ID = requireEnv('ROON_CORE_UNIQUE_ID');
@@ -26,6 +26,10 @@ const BASE_TOPIC = process.env.MQTT_BASE_TOPIC ?? 'unified-hifi'; // matches DEF
 const DISCOVERY_PREFIX = process.env.MQTT_DISCOVERY_PREFIX ?? 'homeassistant';
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
 const RPC_TIMEOUT_MS = 10000;
+// Diagnostics: set DEBUG_ZONE to (part of) a zone name to log, on every poll, which zone/queue
+// objects were read and what the Radio pool's top items were. Off by default.
+const DEBUG_ZONE = (process.env.DEBUG_ZONE ?? '').toLowerCase();
+let lastRadioTop: string[] = [];
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -319,6 +323,15 @@ async function radioNext(roon: RoonClient, swimRef: bigint, zoneName: string): P
     const first = (roon.graph.getObject(queryOid)?.fields as any)?.$items?.[0];
     return first && isRef(first) ? roon.graph.getObject((first as any).$ref) : undefined;
   }, 3000);
+  if (DEBUG_ZONE) {
+    lastRadioTop = [];
+    const refs = (((roon.graph.getObject(queryOid)?.fields as any)?.$items ?? []) as unknown[]).slice(0, 3);
+    for (const r of refs) {
+      const o = isRef(r) ? roon.graph.getObject((r as any).$ref) : undefined;
+      const n = o ? await resolveNext(roon, o) : undefined;
+      lastRadioTop.push(n ? `${n.title} -- ${n.artist}` : '?');
+    }
+  }
   return item ? resolveNext(roon, item) : undefined;
 }
 
@@ -355,6 +368,32 @@ async function queueNext(roon: RoonClient, queueRef: bigint, currentIndex: numbe
 // Cache of the ordinary-queue next item per zone, keyed by (now-playing item id, queue length):
 // GetItems can be large on a long-lived queue, so only refetch when either changes.
 const queueNextCache = new Map<string, { key: string; next: NextTrack | undefined }>();
+
+const reportedDuplicateZones = new Set<string>();
+
+/** One live Zone object per zone id - see `chooseLiveZones`. Duplicates are logged once per shape. */
+function liveZones(roon: RoonClient): RoonObject[] {
+  const all = roon.graph.findByType('Zone');
+  const referenced = new Set<bigint>();
+  for (const ep of roon.graph.findByType('Endpoint')) {
+    const z = refField(ep, '::Zone');
+    if (z !== undefined) referenced.add(z);
+  }
+  const byOid = new Map(all.map((z) => [z.oid, z] as const));
+  const candidates = all.map((z) => {
+    const id = anyField(z, '::ZoneId') as Buffer | undefined;
+    return { oid: z.oid, zoneId: id ? id.toString('hex') : `oid${z.oid}` };
+  });
+  const { live, duplicates } = chooseLiveZones(candidates, referenced);
+  for (const d of duplicates) {
+    const sig = `${d.zoneId}:${d.oids.join(',')}:${d.chosen}`;
+    if (!reportedDuplicateZones.has(sig)) {
+      reportedDuplicateZones.add(sig);
+      log(`zone ${d.zoneId.slice(-6)} has ${d.oids.length} objects in the graph (oids ${d.oids.join(', ')}); using ${d.chosen}, ignoring the stale ones`);
+    }
+  }
+  return live.map((c) => byOid.get(c.oid)!);
+}
 
 async function pollZone(roon: RoonClient, zone: RoonObject, publisher: Publisher) {
   const zoneIdBuf = anyField(zone, '::ZoneId') as Buffer | undefined;
@@ -434,6 +473,15 @@ async function pollZone(roon: RoonClient, zone: RoonObject, publisher: Publisher
     }
   }
 
+  if (DEBUG_ZONE && zoneName.toLowerCase().includes(DEBUG_ZONE)) {
+    log(
+      `[debug ${zoneName}] zoneOid=${zone.oid} queueOid=${queueRef} remaining=${queueRemaining} idx=${currentIndex} count=${queueCount} ` +
+        `loopOrShuffle=${loopOrShuffle} autoRadio=${autoRadio} now="${currentTitle}" -> ${nextSource ?? 'none'}: "${next?.title}" ` +
+        `radioTop=${JSON.stringify(nextSource === 'radio' || lastRadioTop.length ? lastRadioTop : [])}`
+    );
+    lastRadioTop = [];
+  }
+
   publisher.publishZoneState(zoneId, zoneName, 'roon', {
     currentTitle,
     nextTrackTitle: next?.title,
@@ -461,7 +509,7 @@ async function runOnce(publisher: Publisher): Promise<void> {
   try {
     // eslint-disable-next-line no-constant-condition
     while (true) {
-      const zones = roon.graph.findByType('Zone');
+      const zones = liveZones(roon);
       for (const zone of zones) {
         try {
           await pollZone(roon, zone, publisher);

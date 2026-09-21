@@ -25,3 +25,36 @@ export function radioHasNothingToOffer(z: {
   return z.seekSeconds !== undefined && z.seekSeconds >= RADIO_PICK_GRACE_SECONDS;
 }
 
+
+export interface ZoneCandidate {
+  oid: bigint;
+  /** Stable Roon zone id (hex), shared by every object that represents the same zone. */
+  zoneId: string;
+}
+
+/**
+ * The object graph is long-lived and never told to drop superseded objects, so it can hold
+ * several `Zone` objects for one zone id (e.g. after a regroup or reconnect of an output).
+ * Only the one an Endpoint currently points at is live; the others keep stale queue and
+ * Radio data and, published to the same topic, made the next track flip between two values.
+ *
+ * Returns one zone per zoneId: the endpoint-referenced one (highest oid if several), else
+ * the highest oid. `duplicates` lists zone ids that had more than one object.
+ */
+export function chooseLiveZones(
+  zones: ZoneCandidate[],
+  referencedOids: ReadonlySet<bigint>
+): { live: ZoneCandidate[]; duplicates: { zoneId: string; oids: bigint[]; chosen: bigint }[] } {
+  const groups = new Map<string, ZoneCandidate[]>();
+  for (const z of zones) groups.set(z.zoneId, [...(groups.get(z.zoneId) ?? []), z]);
+  const live: ZoneCandidate[] = [];
+  const duplicates: { zoneId: string; oids: bigint[]; chosen: bigint }[] = [];
+  const highest = (zs: ZoneCandidate[]) => zs.reduce((a, b) => (b.oid > a.oid ? b : a));
+  for (const [zoneId, zs] of groups) {
+    const referenced = zs.filter((z) => referencedOids.has(z.oid));
+    const chosen = highest(referenced.length > 0 ? referenced : zs);
+    live.push(chosen);
+    if (zs.length > 1) duplicates.push({ zoneId, oids: zs.map((z) => z.oid), chosen: chosen.oid });
+  }
+  return { live, duplicates };
+}
