@@ -24,12 +24,17 @@ const MQTT_USERNAME = process.env.MQTT_USERNAME;
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD;
 const BASE_TOPIC = process.env.MQTT_BASE_TOPIC ?? 'unified-hifi'; // matches DEFAULT_BASE_TOPIC in src/mqtt/mod.rs
 const DISCOVERY_PREFIX = process.env.MQTT_DISCOVERY_PREFIX ?? 'homeassistant';
-const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 5000);
+// Cheap now: the graph is live-updated by pushes and the expensive lookups are cached, so a
+// short interval mostly just notices track changes quickly.
+const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? 1500);
+const RADIO_POOL_REFRESH_MS = 30000;
+const HEARTBEAT_MS = 15000;
 const RPC_TIMEOUT_MS = 10000;
 // Diagnostics: set DEBUG_ZONE to (part of) a zone name to log, on every poll, which zone/queue
 // objects were read and what the Radio pool's top items were. Off by default.
 const DEBUG_ZONE = (process.env.DEBUG_ZONE ?? '').toLowerCase();
 let lastRadioTop: string[] = [];
+const debugSigs = new Map<string, string>();
 
 function requireEnv(name: string): string {
   const v = process.env[name];
@@ -95,6 +100,7 @@ class Publisher {
   private client: MqttClient;
   private connected = false;
   private zoneState = new Map<string, ZonePublishState>();
+  private lastPublished = new Map<string, { signature: string; at: number }>();
 
   constructor() {
     this.client = mqtt.connect({
@@ -112,6 +118,7 @@ class Publisher {
     });
     this.client.on('connect', () => {
       this.connected = true;
+      this.lastPublished.clear();
       log('mqtt connected');
       this.client.publish(topics.ourAvailabilityTopic(BASE_TOPIC), 'online', { qos: 1, retain: true });
     });
@@ -209,9 +216,7 @@ class Publisher {
     if (!this.connected) return;
     this.ensureDiscovery(zoneId, zoneName, source);
     const stateTopic = topics.ourStateTopic(BASE_TOPIC, zoneId);
-    this.client.publish(
-      stateTopic,
-      JSON.stringify({
+    const body = {
         current_title: state.currentTitle ?? null,
         next_track_title: state.nextTrackTitle ?? null,
         next_track_artist: state.nextTrackArtist ?? null,
@@ -223,10 +228,16 @@ class Publisher {
         sample_rate: state.sampleRate ?? null,
         bit_depth: state.bitDepth ?? null,
         release_year: state.releaseYear ?? null,
-        updated_at: new Date().toISOString(),
-      }),
-      { qos: 0, retain: true }
-    );
+    };
+    // Publish when something changed, or as a heartbeat (UHC treats old data as unknown).
+    const signature = JSON.stringify(body);
+    const prev = this.lastPublished.get(zoneId);
+    if (prev && prev.signature === signature && Date.now() - prev.at < HEARTBEAT_MS) return;
+    this.lastPublished.set(zoneId, { signature, at: Date.now() });
+    this.client.publish(stateTopic, JSON.stringify({ ...body, updated_at: new Date().toISOString() }), {
+      qos: 0,
+      retain: true,
+    });
   }
 }
 
@@ -309,16 +320,24 @@ async function resolveNext(roon: RoonClient, item: RoonObject): Promise<NextTrac
  * some other zone's.) Only Radio picks live here - ordinary queued tracks do
  * not, see `queueNext`.
  */
-async function radioNext(roon: RoonClient, swimRef: bigint, zoneName: string): Promise<NextTrack | undefined> {
+interface RadioLookup {
+  next?: NextTrack;
+  /** true = we got a real answer (a pick, or a confirmed-empty pool). false = the lookup did not
+   * complete (timeout / objects not pushed yet): unknown, must not be cached or read as "nothing". */
+  definitive: boolean;
+}
+
+async function radioNext(roon: RoonClient, swimRef: bigint, zoneName: string): Promise<RadioLookup> {
   const res = await withTimeout(
     roon.call('Swim', 'UpcomingItemsQuery', [{ type: 'ResultCallback<Query<TransportItem>>', name: 'cb' }], Buffer.alloc(0), swimRef),
     RPC_TIMEOUT_MS,
     `Swim.UpcomingItemsQuery(zone=${zoneName})`
   );
-  if (!res.success) return undefined;
+  if (!res.success) return { definitive: false };
   const [queryOid] = readFlexLong(Uint8Array.from(res.payload), 0);
   const query = await waitFor(() => roon.graph.getObject(queryOid), 3000);
-  if (!query || Number((query.fields as any).$count ?? 0) === 0) return undefined;
+  if (!query) return { definitive: false };
+  if (Number((query.fields as any).$count ?? 0) === 0) return { definitive: true };
   const item = await waitFor(() => {
     const first = (roon.graph.getObject(queryOid)?.fields as any)?.$items?.[0];
     return first && isRef(first) ? roon.graph.getObject((first as any).$ref) : undefined;
@@ -332,7 +351,8 @@ async function radioNext(roon: RoonClient, swimRef: bigint, zoneName: string): P
       lastRadioTop.push(n ? `${n.title} -- ${n.artist}` : '?');
     }
   }
-  return item ? resolveNext(roon, item) : undefined;
+  const next = item ? await resolveNext(roon, item) : undefined;
+  return next ? { next, definitive: true } : { definitive: false };
 }
 
 /**
@@ -365,31 +385,30 @@ async function queueNext(roon: RoonClient, queueRef: bigint, currentIndex: numbe
   return item ? resolveNext(roon, item) : undefined;
 }
 
+// Radio's pool only needs re-querying when the current track changes (or occasionally, as
+// Radio can re-rank). Each UpcomingItemsQuery call leaves objects behind in the long-lived graph.
+const radioNextCache = new Map<string, { key: string; at: number; next: NextTrack | undefined }>();
+
 // Cache of the ordinary-queue next item per zone, keyed by (now-playing item id, queue length):
 // GetItems can be large on a long-lived queue, so only refetch when either changes.
 const queueNextCache = new Map<string, { key: string; next: NextTrack | undefined }>();
 
 const reportedDuplicateZones = new Set<string>();
 
-/** One live Zone object per zone id - see `chooseLiveZones`. Duplicates are logged once per shape. */
+/** One live Zone object per zone id (the newest) - see `chooseLiveZones`. Duplicates are logged once per shape. */
 function liveZones(roon: RoonClient): RoonObject[] {
   const all = roon.graph.findByType('Zone');
-  const referenced = new Set<bigint>();
-  for (const ep of roon.graph.findByType('Endpoint')) {
-    const z = refField(ep, '::Zone');
-    if (z !== undefined) referenced.add(z);
-  }
   const byOid = new Map(all.map((z) => [z.oid, z] as const));
   const candidates = all.map((z) => {
     const id = anyField(z, '::ZoneId') as Buffer | undefined;
     return { oid: z.oid, zoneId: id ? id.toString('hex') : `oid${z.oid}` };
   });
-  const { live, duplicates } = chooseLiveZones(candidates, referenced);
+  const { live, duplicates } = chooseLiveZones(candidates);
   for (const d of duplicates) {
-    const sig = `${d.zoneId}:${d.oids.join(',')}:${d.chosen}`;
+    const sig = `${d.zoneId}:${d.chosen}`;
     if (!reportedDuplicateZones.has(sig)) {
       reportedDuplicateZones.add(sig);
-      log(`zone ${d.zoneId.slice(-6)} has ${d.oids.length} objects in the graph (oids ${d.oids.join(', ')}); using ${d.chosen}, ignoring the stale ones`);
+      log(`zone ${d.zoneId.slice(-6)} has ${d.oids.length} objects in the graph; using newest (oid ${d.chosen})`);
     }
   }
   return live.map((c) => byOid.get(c.oid)!);
@@ -443,17 +462,31 @@ async function pollZone(roon: RoonClient, zone: RoonObject, publisher: Publisher
           let cached = queueNextCache.get(zoneId);
           if (!cached || cached.key !== key) {
             cached = { key, next: await queueNext(roon, queueRef, currentIndex, zoneName) };
-            queueNextCache.set(zoneId, cached);
+            // A failed lookup is retried on the next poll rather than remembered.
+            if (cached.next) queueNextCache.set(zoneId, cached);
+            else queueNextCache.delete(zoneId);
           }
           next = cached.next;
           if (next) nextSource = 'queue';
         } else if (!autoRadio) {
           nextNone = true; // queue exhausted and Radio is off: nothing is coming
         } else if (swimRef !== undefined) {
-          next = await radioNext(roon, swimRef, zoneName);
+          const itemKey = String(anyField(nowPlayingItem!, '::TransportItemId'));
+          let rc = radioNextCache.get(zoneId);
+          let definitive = true;
+          if (!rc || rc.key !== itemKey || Date.now() - rc.at > RADIO_POOL_REFRESH_MS) {
+            const lookup = await radioNext(roon, swimRef, zoneName);
+            definitive = lookup.definitive;
+            rc = { key: itemKey, at: Date.now(), next: lookup.next };
+            // Only remember real answers: a lookup that did not complete is retried next poll.
+            if (definitive) radioNextCache.set(zoneId, rc);
+            else radioNextCache.delete(zoneId);
+          }
+          next = rc.next;
           if (next) {
             nextSource = 'radio';
-          } else {
+          } else if (definitive) {
+            // Only a confirmed-empty pool can count as "nothing to offer".
             const swim = roon.graph.getObject(swimRef);
             const seek = anyField(zone, '::SeekPosition');
             nextNone = radioHasNothingToOffer({
@@ -473,7 +506,9 @@ async function pollZone(roon: RoonClient, zone: RoonObject, publisher: Publisher
     }
   }
 
-  if (DEBUG_ZONE && zoneName.toLowerCase().includes(DEBUG_ZONE)) {
+  const debugSig = `${queueRemaining}|${currentIndex}|${queueCount}|${currentTitle}|${nextSource}|${next?.title}|${loopOrShuffle}|${nextNone}`;
+  if (DEBUG_ZONE && zoneName.toLowerCase().includes(DEBUG_ZONE) && debugSigs.get(zoneId) !== debugSig) {
+    debugSigs.set(zoneId, debugSig);
     log(
       `[debug ${zoneName}] zoneOid=${zone.oid} queueOid=${queueRef} remaining=${queueRemaining} idx=${currentIndex} count=${queueCount} ` +
         `loopOrShuffle=${loopOrShuffle} autoRadio=${autoRadio} now="${currentTitle}" -> ${nextSource ?? 'none'}: "${next?.title}" ` +

@@ -13,20 +13,18 @@ assert.equal(nothing({ ...base, seekSeconds: undefined }), false, 'unknown posit
 assert.equal(nothing({ ...base, swimRecomputing: true }), false, 'still recomputing');
 // No active Radio session: Roon only starts one when the queue ends, so unknown.
 assert.equal(nothing({ ...base, swimActive: false }), false);
-// A stale duplicate Zone object must never be published; the endpoint-referenced one wins.
+// Roon replaces zone objects and the graph never drops the old ones: the newest must win.
 {
   const zones = [
     { oid: 10n, zoneId: 'lounge' },
-    { oid: 99n, zoneId: 'lounge' }, // newer oid but nothing points at it
+    { oid: 99n, zoneId: 'lounge' },
+    { oid: 50n, zoneId: 'lounge' },
     { oid: 20n, zoneId: 'office' },
   ];
-  const { live, duplicates } = chooseLiveZones(zones, new Set([10n, 20n]));
-  assert.deepEqual(live.map((z) => z.oid).sort(), [10n, 20n]);
+  const { live, duplicates } = chooseLiveZones(zones);
+  assert.deepEqual(live.map((z) => z.oid).sort(), [20n, 99n]);
   assert.equal(duplicates.length, 1);
-  assert.deepEqual(duplicates[0], { zoneId: 'lounge', oids: [10n, 99n], chosen: 10n });
-  // No endpoint reference at all: fall back to the newest object rather than dropping the zone.
-  assert.deepEqual(chooseLiveZones([{ oid: 1n, zoneId: 'z' }, { oid: 5n, zoneId: 'z' }], new Set()).live[0].oid, 5n);
-  // Two referenced objects: the newest referenced one.
-  assert.equal(chooseLiveZones([{ oid: 1n, zoneId: 'z' }, { oid: 5n, zoneId: 'z' }], new Set([1n, 5n])).live[0].oid, 5n);
+  assert.deepEqual(duplicates[0], { zoneId: 'lounge', oids: [10n, 99n, 50n], chosen: 99n });
+  assert.equal(chooseLiveZones([]).live.length, 0);
 }
 console.log('rules ok');
