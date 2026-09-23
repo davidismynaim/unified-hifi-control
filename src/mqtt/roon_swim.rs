@@ -9,7 +9,7 @@
 //! protocol runs in this process. This module only ever consumes retained
 //! JSON off MQTT topics the sidecar owns (`<base_topic>/roon_swim/<slug>/state`)
 //! - a malformed or missing payload here degrades to "field absent", never a
-//! panic.
+//!   panic.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
