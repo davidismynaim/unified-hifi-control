@@ -244,7 +244,55 @@ pub fn list_tools(hqplayer_enabled: bool) -> Vec<Tool> {
     if !hqplayer_enabled {
         tools.retain(|t| !t.name.starts_with("hifi_hqplayer"));
     }
+    apply_schema_overrides(&mut tools);
     tools
+}
+
+/// Patches advertised `inputSchema` entries the `JsonSchema` derive cannot
+/// represent correctly, post-generation.
+///
+/// `rust-mcp-macros`' derive is deliberately minimal (its own doc comment:
+/// "for more advanced features, consider schemars") and only special-cases
+/// String/bool/integers/floats/`serde_json::Number`/`Vec<T>`/`Option<T>`/
+/// nested-`JsonSchema` structs. Any other type - including
+/// `serde_json::Value`, which is the only representation that can hold
+/// `HifiAppleMusicTool::precondition`'s real shape (a nested object like
+/// `{"playlist_version": 3}` - see `apple_bridge.rs`'s own test for that
+/// exact value) - falls into its hardcoded fallback, `{"type": "unknown"}`.
+/// That is not a valid JSON Schema type, and Home Assistant's MCP schema
+/// converter rejects it outright, breaking HA voice control for every tool,
+/// not just this one, since HA reads `tools/list` as a whole.
+///
+/// Fixing this by narrowing `precondition`'s real Rust type would
+/// misrepresent the actual contract with the Apple Music companion app, and
+/// patching the vendored derive is out of scope for a schema-advertisement
+/// bug. Overriding just this one field's advertised schema text - the real
+/// serde type, wire format, and runtime behavior are all untouched - is the
+/// narrow, correct fix.
+///
+/// [`tests::no_advertised_schema_uses_the_invalid_unknown_type`] is the
+/// regression test: it scans every tool this function has already run on,
+/// so a future tool that hits the same derive gap fails loudly here rather
+/// than silently breaking HA again.
+fn apply_schema_overrides(tools: &mut [Tool]) {
+    for tool in tools.iter_mut() {
+        if tool.name != "hifi_apple_music" {
+            continue;
+        }
+        let Some(properties) = tool.input_schema.properties.as_mut() else {
+            continue;
+        };
+        let Some(schema) = serde_json::json!({
+            "type": "object",
+            "nullable": true,
+            "description": "Read-before-write revision or ownership precondition."
+        })
+        .as_object()
+        .cloned() else {
+            continue;
+        };
+        properties.insert("precondition".to_string(), schema);
+    }
 }
 
 #[cfg(test)]
@@ -342,5 +390,32 @@ mod tests {
             static_param("hifi_now_playing", "missing field `query`"),
             None
         );
+    }
+
+    /// `rust-mcp-macros`' `JsonSchema` derive falls back to `{"type":
+    /// "unknown"}` for any type it doesn't special-case (see
+    /// `apply_schema_overrides`'s doc comment) - not a valid JSON Schema
+    /// type, and exactly what broke Home Assistant's MCP schema converter
+    /// for `hifi_apple_music.precondition`. `apply_schema_overrides` fixes
+    /// that one known case; this test is the regression guard so a
+    /// *future* tool field that hits the same derive gap fails a build
+    /// instead of silently breaking HA voice control again.
+    #[test]
+    fn no_advertised_schema_uses_the_invalid_unknown_type() {
+        for tool in list_tools(true) {
+            let Some(properties) = &tool.input_schema.properties else {
+                continue;
+            };
+            for (field, schema) in properties {
+                assert_ne!(
+                    schema.get("type").and_then(|t| t.as_str()),
+                    Some("unknown"),
+                    "{}.{} advertises the invalid JSON Schema type \"unknown\" - \
+                     add an apply_schema_overrides() entry for it",
+                    tool.name,
+                    field
+                );
+            }
+        }
     }
 }
