@@ -53,7 +53,7 @@
         "precondition": {
           "description": "Read-before-write revision or ownership precondition.",
           "nullable": true,
-          "type": "unknown"
+          "type": "object"
         },
         "query": {
           "description": "Search/query text.",
