@@ -11,7 +11,7 @@ use roon_api::{
     },
     image::{Args as ImageArgs, Format as ImageFormat, Image, Scale, Scaling},
     status::{self, Status},
-    transport::{self, volume, Control, Seek, Transport, Zone as RoonZone},
+    transport::{self, volume, Control, QueueItem, Seek, Transport, Zone as RoonZone},
     CoreEvent, Info, Parsed, RoonApi, RoonApiError, Services, Svc,
 };
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,11 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{oneshot, Mutex, RwLock, Semaphore};
+use super::roon_queue::{
+    next_after_current, QueueNext, QueueNextEntry, QueueNextView, QueueTrack, QUEUE_LOOK_AHEAD,
+    QUEUE_READ_TIMEOUT, QUEUE_REFRESH,
+};
+use tokio::sync::{mpsc, oneshot, Mutex, RwLock, Semaphore};
 use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
 
@@ -959,6 +963,16 @@ struct RoonState {
     pending_browses: HashMap<usize, (Option<String>, BrowseRequest)>,
     /// Pending load requests: request_id -> (session_key, oneshot sender)
     pending_loads: HashMap<usize, (Option<String>, LoadRequest)>,
+    /// Latest read of each zone's real queue: what follows the playing track (see `roon_queue`).
+    queue_next: HashMap<String, QueueNextEntry>,
+    /// (playing title, queue_items_remaining) each zone had when its queue was last requested,
+    /// so a queue is read again only when one of them changes.
+    queue_signature: HashMap<String, (Option<String>, i64)>,
+    /// The one queue subscription in flight. The fork keeps a single queue-subscription slot,
+    /// so reads are strictly one at a time; the event loop completes this with the Core's answer.
+    pending_queue: Option<(String, oneshot::Sender<Vec<QueueItem>>)>,
+    /// Wakes the queue reader with a zone id whose queue should be read.
+    queue_trigger: Option<mpsc::UnboundedSender<String>>,
 }
 
 async fn clear_roon_runtime_state(state: &Arc<RwLock<RoonState>>) {
@@ -973,6 +987,10 @@ async fn clear_roon_runtime_state(state: &Arc<RwLock<RoonState>>) {
     state.pending_images.clear();
     state.pending_browses.clear();
     state.pending_loads.clear();
+    state.queue_next.clear();
+    state.queue_signature.clear();
+    state.pending_queue = None;
+    state.queue_trigger = None;
 }
 
 impl RoonState {
@@ -1551,6 +1569,17 @@ impl RoonAdapter {
     pub async fn get_zones(&self) -> Vec<Zone> {
         let state = self.state.read().await;
         state.zones.values().cloned().collect()
+    }
+
+    /// What follows the playing track in this zone's real queue, read through the official API.
+    /// Always answers: `unknown` when nothing usable has been read.
+    pub async fn queue_next_for(&self, zone_id: &str) -> QueueNextView {
+        let zone_id = strip_roon_prefix(zone_id);
+        let state = self.state.read().await;
+        match state.queue_next.get(zone_id) {
+            Some(entry) => QueueNextView::from_entry(zone_id, entry, std::time::Instant::now()),
+            None => QueueNextView::unknown(zone_id),
+        }
     }
 
     /// Get specific zone
@@ -4219,6 +4248,103 @@ async fn execute_roon_runtime_command(
 }
 
 /// Convert Roon zone to our Zone struct
+/// Reads zone queues from the official API, one at a time, whenever a zone's track or queue length
+/// changes and every `QUEUE_REFRESH` for zones that are playing.
+async fn queue_reader(
+    state: Arc<RwLock<RoonState>>,
+    mut wake: mpsc::UnboundedReceiver<String>,
+    shutdown: CancellationToken,
+) {
+    let mut refresh = tokio::time::interval(QUEUE_REFRESH);
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    refresh.tick().await; // the first tick is immediate; nothing has played yet
+    loop {
+        let mut zones: Vec<String> = Vec::new();
+        tokio::select! {
+            _ = shutdown.cancelled() => return,
+            zone = wake.recv() => match zone {
+                Some(zone) => zones.push(zone),
+                None => return,
+            },
+            _ = refresh.tick() => {
+                let s = state.read().await;
+                zones.extend(s.zones.iter().filter(|(_, z)| z.now_playing.is_some()).map(|(id, _)| id.clone()));
+            }
+        }
+        // Coalesce whatever else is already waiting, so a burst of zone updates is one read each.
+        while let Ok(zone) = wake.try_recv() {
+            if !zones.contains(&zone) {
+                zones.push(zone);
+            }
+        }
+        for zone_id in zones {
+            read_queue_next(&state, &zone_id).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    }
+}
+
+/// One official-API queue read for `zone_id`: subscribe for the first few items, take the first
+/// answer, unsubscribe, and record what follows the playing track.
+async fn read_queue_next(state: &Arc<RwLock<RoonState>>, zone_id: &str) {
+    let (answer_tx, answer_rx) = oneshot::channel();
+    let (transport, playing_title) = {
+        let mut s = state.write().await;
+        if !s.connected || s.pending_queue.is_some() {
+            return;
+        }
+        let Some(transport) = s.transport.clone() else { return };
+        let Some(title) = s
+            .zones
+            .get(zone_id)
+            .and_then(|z| z.now_playing.as_ref())
+            .map(|np| np.title.clone())
+        else {
+            return;
+        };
+        s.pending_queue = Some((zone_id.to_string(), answer_tx));
+        (transport, title)
+    };
+
+    transport.subscribe_queue(zone_id, QUEUE_LOOK_AHEAD).await;
+    let answer = tokio::time::timeout(QUEUE_READ_TIMEOUT, answer_rx).await;
+    transport.unsubscribe_queue().await;
+
+    let mut s = state.write().await;
+    s.pending_queue = None;
+    let items = match answer {
+        Ok(Ok(items)) => items,
+        _ => {
+            tracing::debug!("Roon queue read for zone {zone_id} got no answer");
+            return;
+        }
+    };
+    let tracks: Vec<QueueTrack> = items.iter().map(QueueTrack::from).collect();
+    let next = next_after_current(&tracks, &playing_title);
+    tracing::debug!(
+        "Roon queue for zone {zone_id}: playing {:?}, first items {:?} -> {:?}",
+        playing_title,
+        tracks.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+        next
+    );
+    if next == QueueNext::Unknown && !tracks.is_empty() {
+        tracing::info!(
+            "Roon queue for zone {zone_id} does not contain the playing track {:?} in its first {} items ({:?}); next track unknown",
+            playing_title,
+            tracks.len(),
+            tracks.iter().map(|t| t.title.as_str()).collect::<Vec<_>>()
+        );
+    }
+    s.queue_next.insert(
+        zone_id.to_string(),
+        QueueNextEntry {
+            for_title: playing_title,
+            next,
+            fetched_at: std::time::Instant::now(),
+        },
+    );
+}
+
 fn convert_zone(roon_zone: &RoonZone) -> Zone {
     let now_playing = roon_zone.now_playing.as_ref().map(|np| NowPlaying {
         title: np.three_line.line1.clone(),
@@ -4443,6 +4569,17 @@ async fn run_roon_loop(
             connected
         }
     };
+
+    // Real-queue reader: one official-API queue read at a time, woken by zone changes.
+    let (queue_tx, queue_rx) = mpsc::unbounded_channel::<String>();
+    state.write().await.queue_trigger = Some(queue_tx);
+    {
+        let state_for_queue = state.clone();
+        let shutdown_for_queue = shutdown.clone();
+        handles.spawn(async move {
+            queue_reader(state_for_queue, queue_rx, shutdown_for_queue).await;
+        });
+    }
 
     // Event processing task
     let state_for_events = state.clone();
@@ -4713,6 +4850,21 @@ async fn run_roon_loop(
                             if runtime_bridge_for_events.is_some() {
                                 complete_zones.push(roon_zone_to_bus_zone(&converted));
                             }
+
+                            // A new track, or a change to how much is queued, means the zone's
+                            // next track may have changed: have its real queue read again.
+                            if zone.now_playing.is_some() {
+                                let signature = (
+                                    zone.now_playing.as_ref().map(|n| n.three_line.line1.clone()),
+                                    zone.queue_items_remaining,
+                                );
+                                if s.queue_signature.get(&zone.zone_id) != Some(&signature) {
+                                    s.queue_signature.insert(zone.zone_id.clone(), signature);
+                                    if let Some(tx) = s.queue_trigger.as_ref() {
+                                        let _ = tx.send(zone.zone_id.clone());
+                                    }
+                                }
+                            }
                             }
                             complete_zones
                         };
@@ -4765,6 +4917,8 @@ async fn run_roon_loop(
                             for zone_id in zone_ids {
                             tracing::debug!("Zone removed: {}", zone_id);
                             s.zones.remove(&zone_id);
+                            s.queue_next.remove(&zone_id);
+                            s.queue_signature.remove(&zone_id);
 
                             // Publish zone removed event
                             // Use prefixed zone_id to match aggregator's stored format
@@ -4965,6 +5119,15 @@ async fn run_roon_loop(
                             ErrorRouting::Browse | ErrorRouting::Load | ErrorRouting::Image => {
                                 tracing::debug!("Roon error routed to its {:?} request: {}", routing, err)
                             }
+                        }
+                    }
+                    // The first answer to a queue subscription: hand it to the reader waiting on
+                    // it. Later `QueueChanges` for that subscription are not needed (the reader
+                    // unsubscribes as soon as it has this).
+                    Parsed::Queue(items) => {
+                        let waiter = state_for_events.write().await.pending_queue.take();
+                        if let Some((_, tx)) = waiter {
+                            let _ = tx.send(items);
                         }
                     }
                     _ => {}

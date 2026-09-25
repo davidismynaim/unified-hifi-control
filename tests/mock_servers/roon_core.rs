@@ -741,6 +741,11 @@ struct CoreState {
     /// push their effect on this same subscription, mirroring a real Core --
     /// see the `SubscribeZones` handler for why it must be this req_id.
     zone_push: Option<(usize, Writer)>,
+    /// Items answered to `subscribe_queue` (first `max_item_count`, like a real Core), as the
+    /// official API lists them: the playing item first, then what follows.
+    queue_items: Vec<Value>,
+    /// How many `subscribe_queue` requests were received, and the largest `max_item_count` asked.
+    queue_requests: Vec<u64>,
 }
 
 // =============================================================================
@@ -793,6 +798,8 @@ impl FakeRoonCore {
             display_name: "Fake Roon Core".to_string(),
             display_version: "2.0.408".to_string(),
             zone_push: None,
+            queue_items: Vec::new(),
+            queue_requests: Vec::new(),
         }));
         let root_title = library.root_title.clone();
 
@@ -973,6 +980,26 @@ impl FakeRoonCore {
 
     pub async fn set_zones(&self, zones: Vec<Value>) {
         self.state.write().await.zones = zones;
+    }
+
+    /// What `subscribe_queue` answers with (playing item first, as the official API lists it).
+    pub async fn set_queue_items(&self, items: Vec<Value>) {
+        self.state.write().await.queue_items = items;
+    }
+
+    /// The `max_item_count` of every `subscribe_queue` received so far.
+    pub async fn queue_requests(&self) -> Vec<u64> {
+        self.state.read().await.queue_requests.clone()
+    }
+
+    /// Push a changed zone on the open `subscribe_zones` subscription, as a real Core does when a
+    /// track changes.
+    pub async fn push_zone_changed(&self, zone: Value) {
+        let push = self.state.read().await.zone_push.clone();
+        if let Some((sub_req_id, sub_writer)) = push {
+            let change = json!({ "zones_changed": [zone] });
+            send(&sub_writer, "CONTINUE", "Changed", sub_req_id, Some(&change)).await;
+        }
     }
 
     pub async fn core_name(&self) -> String {
@@ -1486,6 +1513,31 @@ async fn handle_request(
             )
             .await;
         }
+        RequestKind::SubscribeQueue => {
+            // FROM FORK: transport.rs:527-535 recognises the answer only when its req_id is the
+            // queue subscription's and the name is "Subscribed" with an `items` array.
+            let wanted = body
+                .get("max_item_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let items: Vec<Value> = {
+                let mut st = core.write().await;
+                st.queue_requests.push(wanted);
+                st.queue_items.iter().take(wanted as usize).cloned().collect()
+            };
+            respond(
+                &core,
+                &writer,
+                "CONTINUE",
+                "Subscribed",
+                req_id,
+                Some(&json!({ "items": items })),
+            )
+            .await;
+        }
+        RequestKind::UnsubscribeQueue => {
+            respond(&core, &writer, "COMPLETE", "Success", req_id, None).await;
+        }
         RequestKind::UnsubscribeZones | RequestKind::Ping => {
             respond(&core, &writer, "COMPLETE", "Success", req_id, None).await;
         }
@@ -1544,6 +1596,8 @@ enum RequestKind {
     RegistryRegister,
     SubscribeZones,
     UnsubscribeZones,
+    SubscribeQueue,
+    UnsubscribeQueue,
     Browse,
     Load,
     Ping,
@@ -1560,6 +1614,8 @@ impl RequestKind {
             "com.roonlabs.registry:1/register" => Self::RegistryRegister,
             "com.roonlabs.transport:2/subscribe_zones" => Self::SubscribeZones,
             "com.roonlabs.transport:2/unsubscribe_zones" => Self::UnsubscribeZones,
+            "com.roonlabs.transport:2/subscribe_queue" => Self::SubscribeQueue,
+            "com.roonlabs.transport:2/unsubscribe_queue" => Self::UnsubscribeQueue,
             "com.roonlabs.browse:1/browse" => Self::Browse,
             "com.roonlabs.browse:1/load" => Self::Load,
             "com.roonlabs.ping:1/ping" => Self::Ping,

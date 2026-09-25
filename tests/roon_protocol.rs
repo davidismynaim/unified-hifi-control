@@ -31,7 +31,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mock_servers::roon_core::{
-    album, album_live, artist_live, playlist, playlist_live, radio_station, zone_with_grouping,
+    album, album_live, artist_live, default_zone, playlist, playlist_live, radio_station,
+    zone_with_grouping,
     FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
 };
 use roon_api::browse::{BrowseOpts, LoadOpts};
@@ -295,6 +296,103 @@ async fn roon_core_publishes_zones() {
         .expect("output volume should survive deserialization");
     assert_eq!(volume.value, Some(50.0));
     assert_eq!(volume.max, Some(100.0));
+
+    core.stop().await;
+}
+
+/// A zone that is playing `title`, with `remaining` items still counted in its queue.
+fn playing_zone(zone_id: &str, title: &str, remaining: i64) -> serde_json::Value {
+    let mut zone = default_zone(zone_id, "Fake Dining Room");
+    zone["state"] = serde_json::json!("playing");
+    zone["queue_items_remaining"] = serde_json::json!(remaining);
+    zone["now_playing"] = serde_json::json!({
+        "one_line": { "line1": format!("{title} - Fake Artist") },
+        "two_line": { "line1": title, "line2": "Fake Artist" },
+        "three_line": { "line1": title, "line2": "Fake Artist", "line3": "Fake Album" },
+    });
+    zone
+}
+
+fn queue_item(id: u32, title: &str, artist: &str) -> serde_json::Value {
+    serde_json::json!({
+        "queue_item_id": id,
+        "length": 200,
+        "image_key": null,
+        "one_line": { "line1": format!("{title} - {artist}") },
+        "two_line": { "line1": title, "line2": artist },
+        "three_line": { "line1": title, "line2": artist, "line3": "Fake Album" },
+    })
+}
+
+async fn wait_for_queue_status(
+    adapter: &RoonAdapter,
+    zone_id: &str,
+    want: &str,
+    for_title: &str,
+) -> unified_hifi_control::adapters::roon_queue::QueueNextView {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let view = adapter.queue_next_for(zone_id).await;
+        if (view.status == want && view.for_title.as_deref() == Some(for_title))
+            || Instant::now() > deadline
+        {
+            return view;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The next track of a real queue comes from Roon's official `subscribe_queue`, asking for only a
+/// few items (the private protocol's `GetItems` returns the whole queue - 8000 items on a
+/// long-lived one), and is read again when the zone moves to a new track.
+#[tokio::test]
+async fn real_queue_next_track_is_read_through_the_official_api_and_follows_the_track() {
+    let core = FakeRoonCore::start().await;
+    core.set_zones(vec![playing_zone("zone_q", "Bloody Well Right", 7)])
+        .await;
+    core.set_queue_items(vec![
+        queue_item(1, "Bloody Well Right", "Supertramp"),
+        queue_item(2, "Hide In Your Shell", "Supertramp"),
+        queue_item(3, "Asylum", "Supertramp"),
+        queue_item(4, "Dreamer", "Supertramp"),
+    ])
+    .await;
+    let adapter = connected(&core).await;
+
+    let view = wait_for_queue_status(&adapter, "zone_q", "next", "Bloody Well Right").await;
+    assert_eq!(view.status, "next", "no next track was read: {view:?}");
+    assert_eq!(view.next_title.as_deref(), Some("Hide In Your Shell"));
+    assert_eq!(view.next_artist.as_deref(), Some("Supertramp"));
+    let asked = core.queue_requests().await;
+    assert!(!asked.is_empty() && asked.iter().all(|n| *n <= 3), "asked for too much: {asked:?}");
+
+    // The track changes: the queue is read again and the answer follows it.
+    core.push_zone_changed(playing_zone("zone_q", "Hide In Your Shell", 6))
+        .await;
+    let view = wait_for_queue_status(&adapter, "zone_q", "next", "Hide In Your Shell").await;
+    assert_eq!(view.for_title.as_deref(), Some("Hide In Your Shell"));
+    assert_eq!(view.next_title.as_deref(), Some("Asylum"));
+
+    core.stop().await;
+}
+
+/// Unknown is reported as unknown - never a guessed track - when the playing track is not among
+/// the items read, and a queue that has really ended is reported as `last`.
+#[tokio::test]
+async fn real_queue_next_track_is_unknown_when_it_cannot_be_established() {
+    let core = FakeRoonCore::start().await;
+    core.set_zones(vec![playing_zone("zone_q", "Playing", 1)]).await;
+    core.set_queue_items(vec![queue_item(9, "Some other track", "X")]).await;
+    let adapter = connected(&core).await;
+    let view = wait_for_queue_status(&adapter, "zone_q", "unknown", "Playing").await;
+    assert_eq!(view.status, "unknown");
+    assert_eq!(view.for_title.as_deref(), Some("Playing"));
+    assert!(view.next_title.is_none());
+
+    core.set_queue_items(vec![queue_item(1, "Playing", "X")]).await;
+    core.push_zone_changed(playing_zone("zone_q", "Playing", 0)).await;
+    let view = wait_for_queue_status(&adapter, "zone_q", "last", "Playing").await;
+    assert_eq!(view.status, "last", "end of queue not recognised: {view:?}");
 
     core.stop().await;
 }

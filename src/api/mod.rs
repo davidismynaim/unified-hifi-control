@@ -1078,6 +1078,16 @@ pub async fn roon_zones_handler(
     })
 }
 
+/// GET /roon/zone/:zone_id/queue_next - what follows the playing track in the zone's real queue,
+/// read through Roon's official API (see `adapters::roon_queue`). `status` is `next`, `last` or
+/// `unknown`; `for_title` is the track that was playing when the queue was read.
+pub async fn roon_queue_next_handler(
+    State(state): State<AppState>,
+    Path(zone_id): Path<String>,
+) -> Json<crate::adapters::roon_queue::QueueNextView> {
+    Json(state.roon.queue_next_for(&zone_id).await)
+}
+
 /// GET /roon/zone/:zone_id - Get specific zone
 pub async fn roon_zone_handler(
     State(state): State<AppState>,

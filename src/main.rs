@@ -932,6 +932,7 @@ mod server {
             .route("/roon/status", get(api::roon_status_handler))
             .route("/roon/zones", get(api::roon_zones_handler))
             .route("/roon/zone/{zone_id}", get(api::roon_zone_handler))
+            .route("/roon/zone/{zone_id}/queue_next", get(api::roon_queue_next_handler))
             .route("/roon/control", post(api::roon_control_handler))
             .route("/roon/volume", post(api::roon_volume_handler))
             .route("/roon/image", get(api::roon_image_handler))
