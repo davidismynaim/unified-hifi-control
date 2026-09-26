@@ -1152,7 +1152,7 @@ async fn search_and_play_navigates_into_a_result_to_find_a_playable_action() {
         )
         .await
         .expect("search_and_play should find a playable action");
-    assert_eq!(message, "Play Now: Kind of Blue");
+    assert_eq!(message, "Play Now: Kind of Blue - Miles Davis");
 
     assert_eq!(
         core.browsed_titles().await,
@@ -1188,7 +1188,7 @@ async fn queue_and_radio_invoke_different_actions_than_play() {
         )
         .await
         .unwrap();
-    assert_eq!(queued, "Queue: Kind of Blue");
+    assert_eq!(queued, "Queue: Kind of Blue - Miles Davis");
 
     let invoked = core.browsed_titles().await;
     assert!(invoked.contains(&"Queue".to_string()), "got {invoked:?}");
@@ -1231,6 +1231,130 @@ async fn an_action_the_core_does_not_offer_is_reported_with_what_is_available() 
     assert!(
         text.contains("Play Now"),
         "should list what is available: {text}"
+    );
+
+    core.stop().await;
+}
+
+// =============================================================================
+// A search hit that does not match the request must not be played
+// =============================================================================
+
+/// Roon matches the WORDS of a query against titles, so "The Best of Goldfrapp" ranks Bob Marley's "The Best
+/// Of" compilation first. That used to be played and reported as a success. It must now be refused, name what
+/// Roon offered, and invoke no play action at all.
+#[tokio::test]
+async fn a_top_hit_by_the_wrong_artist_is_refused_and_nothing_is_played() {
+    let mut library = FakeLibrary::standard();
+    library.word_match_search = true; // like Roon: any word of the query can match
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![FakeItem::list("Legend \u{2013} The Best Of Bob Marley & The Wailers")
+            .with_subtitle("[[41082|Bob Marley & The Wailers]]")
+            .with_children(vec![FakeItem::action_list("Play Album")
+                .with_children(vec![FakeItem::action("Play Now")])])],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let error = adapter
+        .search_and_play(
+            "The Best of Goldfrapp",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+        )
+        .await
+        .expect_err("a Bob Marley album is not what was asked for");
+    let text = error.to_string();
+    assert!(text.contains("No confident match"), "got {text}");
+    assert!(text.contains("nothing played"), "got {text}");
+    assert!(text.contains("Bob Marley"), "should name what Roon offered: {text}");
+    assert!(text.contains("goldfrapp"), "should name the missing word: {text}");
+
+    let invoked = core.browsed_titles().await;
+    assert!(
+        !invoked.contains(&"Play Now".to_string()),
+        "no play action may be invoked for a non-matching hit: {invoked:?}"
+    );
+
+    core.stop().await;
+}
+
+/// When a later result really is what was asked for, it is chosen over Roon's higher-ranked unrelated hit.
+#[tokio::test]
+async fn a_matching_result_is_chosen_over_a_higher_ranked_unrelated_one() {
+    let mut library = FakeLibrary::standard();
+    library.word_match_search = true; // like Roon: any word of the query can match
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![
+            FakeItem::list("Legend \u{2013} The Best Of Bob Marley & The Wailers")
+                .with_subtitle("[[41082|Bob Marley & The Wailers]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+            FakeItem::list("The Singles")
+                .with_subtitle("[[7|Goldfrapp]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+        ],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play(
+            "The Best of Goldfrapp",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+        )
+        .await
+        .expect("The Singles by Goldfrapp matches the request");
+    assert_eq!(message, "Play Now: The Singles - Goldfrapp");
+
+    let invoked = core.browsed_titles().await;
+    assert!(
+        invoked.contains(&"The Singles".to_string()) && !invoked.iter().any(|t| t.contains("Bob Marley")),
+        "must navigate into the Goldfrapp album only: {invoked:?}"
+    );
+
+    core.stop().await;
+}
+
+/// Today's Rolling Stones case: the request was the compilation "GRRR!", which is not in the library. Roon's top
+/// hit was a single TRACK by the right artist ("Live By The Sword", on Hackney Diamonds), which used to be played
+/// and announced as GRRR!. A track by the right artist is still not what was asked for: "grrr" is missing.
+#[tokio::test]
+async fn a_track_by_the_right_artist_is_not_the_album_that_was_asked_for() {
+    let mut library = FakeLibrary::standard();
+    library.word_match_search = true;
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![FakeItem::list("Live By The Sword")
+            .with_subtitle("Mick Jagger, Keith Richards, [[5|The Rolling Stones]]")
+            .with_children(vec![FakeItem::action_list("Play Album")
+                .with_children(vec![FakeItem::action("Play Now")])])],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let error = adapter
+        .search_and_play(
+            "GRRR! by The Rolling Stones",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+        )
+        .await
+        .expect_err("GRRR! is not in the library; the track must not be played instead");
+    let text = error.to_string();
+    assert!(text.contains("nothing played"), "got {text}");
+    assert!(text.contains("grrr"), "should name the missing word: {text}");
+    assert!(text.contains("Live By The Sword"), "should name what Roon offered: {text}");
+    assert!(
+        !core.browsed_titles().await.contains(&"Play Now".to_string()),
+        "nothing may be played"
     );
 
     core.stop().await;

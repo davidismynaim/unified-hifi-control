@@ -380,6 +380,10 @@ pub struct FakeLibrary {
     /// Candidate results, matched by case-insensitive substring against title and
     /// subtitle. Keyed by the source name they are reachable through.
     pub search_results: HashMap<String, Vec<FakeItem>>,
+    /// Match like the real Roon: a result matches when ANY word of the query (three letters or more) appears
+    /// in its title or subtitle, instead of the whole query being a substring. This is what let "The Best of
+    /// Goldfrapp" return Bob Marley's "The Best Of" compilation. Off by default so older tests are unchanged.
+    pub word_match_search: bool,
 }
 
 impl FakeLibrary {
@@ -435,6 +439,7 @@ impl FakeLibrary {
                 FakeItem::new("Settings").unkeyed(),
             ],
             search_results,
+            word_match_search: false,
         }
     }
 }
@@ -561,6 +566,8 @@ struct Arena {
     root_children: Vec<usize>,
     /// source name -> candidate result indices
     search_results: HashMap<String, Vec<usize>>,
+    /// Word-wise (Roon-like) instead of whole-query substring matching; see `FakeLibrary::word_match_search`.
+    word_match: bool,
     nonce: u32,
 }
 
@@ -594,6 +601,7 @@ impl Arena {
             nodes,
             root_children,
             search_results,
+            word_match: library.word_match_search,
             nonce,
         }
     }
@@ -2229,6 +2237,8 @@ fn contains(state: &CoreState, parent: usize, needle: usize) -> bool {
 
 fn search(state: &CoreState, source: &str, query: &str) -> Vec<usize> {
     let query = query.to_lowercase();
+    let words: Vec<&str> = query.split_whitespace().filter(|w| w.chars().count() >= 3).collect();
+    let word_match = state.arena.word_match;
     state
         .arena
         .search_results
@@ -2239,6 +2249,14 @@ fn search(state: &CoreState, source: &str, query: &str) -> Vec<usize> {
                 .copied()
                 .filter(|&index| {
                     let node = &state.arena.nodes[index];
+                    if word_match {
+                        let hay = format!(
+                            "{} {}",
+                            node.title.to_lowercase(),
+                            node.subtitle.as_deref().unwrap_or("").to_lowercase()
+                        );
+                        return words.iter().any(|w| hay.contains(w));
+                    }
                     node.title.to_lowercase().contains(&query)
                         || node
                             .subtitle

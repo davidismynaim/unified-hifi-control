@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
+use super::roon_match;
 use super::roon_queue::{
     next_after_current, QueueNext, QueueNextEntry, QueueNextView, QueueTrack, QUEUE_LOOK_AHEAD,
     QUEUE_READ_TIMEOUT, QUEUE_REFRESH,
@@ -189,6 +190,34 @@ fn find_playable_item(items: &[BrowseItem]) -> Option<&BrowseItem> {
             Some(ItemHint::Action) | Some(ItemHint::ActionList)
         )
     })
+}
+
+/// The refusal returned when nothing in Roon's results matches what was asked for. It names the closest
+/// results and the words that were missing, so the caller can search properly (`hifi_search`) instead of
+/// being told something was played that was not.
+fn no_confident_match(query: &str, items: &[BrowseItem]) -> anyhow::Error {
+    let closest: Vec<String> = items
+        .iter()
+        .filter(|item| !is_category(item))
+        .take(3)
+        .map(|item| roon_match::display_title(&item.title, item.subtitle.as_deref()))
+        .collect();
+    let missing = items
+        .iter()
+        .find(|item| !is_category(item))
+        .map(|item| roon_match::missing_tokens(query, &item.title, item.subtitle.as_deref()))
+        .unwrap_or_default();
+    anyhow::anyhow!(
+        "No confident match for '{query}': nothing played. Roon's closest results were [{}]{}. \
+         Do not assume anything is playing. Search with hifi_search for the exact title and artist, or \
+         say that it could not be found.",
+        closest.join("; "),
+        if missing.is_empty() {
+            String::new()
+        } else {
+            format!(" and none contains '{}'", missing.join("', '"))
+        }
+    )
 }
 
 /// Check if an item is a category (Albums, Tracks, etc.) rather than playable content
@@ -2811,9 +2840,12 @@ impl RoonAdapter {
             })
             .await?;
 
-        // Find first playable item
-        if let Some(playable) = find_playable_item(&search_results.items) {
-            let playable_title = playable.title.clone();
+        // Find first playable item - but only one that really matches the query. Roon matches the WORDS of a
+        // query against titles, so "The Best of Goldfrapp" ranks Bob Marley's "The Best Of" compilation first.
+        if let Some(playable) = find_playable_item(&search_results.items).filter(|p| {
+            roon_match::candidate_matches(query, &p.title, p.subtitle.as_deref())
+        }) {
+            let playable_title = roon_match::display_title(&playable.title, playable.subtitle.as_deref());
             let playable_key = playable
                 .item_key
                 .clone()
@@ -2832,7 +2864,7 @@ impl RoonAdapter {
 
         // Try navigating deeper
         if let Some(result) = self
-            .try_navigate_to_playable(&session_key, bare_zone_id, &search_results.items, action)
+            .try_navigate_to_playable(query, &session_key, bare_zone_id, &search_results.items, action)
             .await?
         {
             return Ok(result);
@@ -2840,29 +2872,35 @@ impl RoonAdapter {
 
         // Try category fallback
         if let Some(result) = self
-            .try_category_playable(&session_key, bare_zone_id, &search_results.items, action)
+            .try_category_playable(query, &session_key, bare_zone_id, &search_results.items, action)
             .await?
         {
             return Ok(result);
         }
 
-        Err(anyhow::anyhow!("No playable results found for '{}'", query))
+        Err(no_confident_match(query, &search_results.items))
     }
 
     /// Try to navigate into the first non-category item to find playable content
     async fn try_navigate_to_playable(
         &self,
+        query: &str,
         session_key: &str,
         zone_id: &str,
         items: &[BrowseItem],
         action: PlayAction,
     ) -> Result<Option<String>> {
-        let first = match items.first() {
-            Some(item) if !is_category(item) && item.item_key.is_some() => item,
-            _ => return Ok(None),
+        // The first non-category row that actually matches the query (not merely Roon's top-ranked row).
+        let first = match items.iter().find(|item| {
+            !is_category(item)
+                && item.item_key.is_some()
+                && roon_match::candidate_matches(query, &item.title, item.subtitle.as_deref())
+        }) {
+            Some(item) => item,
+            None => return Ok(None),
         };
 
-        let first_title = first.title.clone();
+        let first_title = roon_match::display_title(&first.title, first.subtitle.as_deref());
         let first_key = first
             .item_key
             .clone()
@@ -2941,6 +2979,7 @@ impl RoonAdapter {
     /// Try to find playable content in Albums or Tracks category
     async fn try_category_playable(
         &self,
+        query: &str,
         session_key: &str,
         zone_id: &str,
         items: &[BrowseItem],
@@ -2976,8 +3015,10 @@ impl RoonAdapter {
             })
             .await?;
 
-        if let Some(playable) = find_playable_item(&category_items.items) {
-            let title = playable.title.clone();
+        if let Some(playable) = find_playable_item(&category_items.items).filter(|p| {
+            roon_match::candidate_matches(query, &p.title, p.subtitle.as_deref())
+        }) {
+            let title = roon_match::display_title(&playable.title, playable.subtitle.as_deref());
             let key = playable
                 .item_key
                 .clone()
@@ -2989,10 +3030,13 @@ impl RoonAdapter {
             ));
         }
 
-        // Try first item in category
-        if let Some(first_item) = category_items.items.first() {
+        // Try the first item in the category that matches the query
+        if let Some(first_item) = category_items.items.iter().find(|item| {
+            roon_match::candidate_matches(query, &item.title, item.subtitle.as_deref())
+        }) {
             if let Some(first_key) = &first_item.item_key {
-                let first_title = first_item.title.clone();
+                let first_title =
+                    roon_match::display_title(&first_item.title, first_item.subtitle.as_deref());
 
                 self.browse(BrowseOpts {
                     multi_session_key: Some(session_key.to_string()),
@@ -3703,7 +3747,7 @@ impl RoonAdapter {
                     ..Default::default()
                 })
                 .await?;
-                Ok(format!("{inner_verb}: {verb}"))
+                Ok(format!("{inner_verb}: {item_title}"))
             }
         }
     }

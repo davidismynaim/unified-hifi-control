@@ -129,6 +129,18 @@ impl QueueNextView {
     }
 }
 
+
+/// `GET /roon/zone/:zone_id/queue_next` - what follows the playing track in the zone's real queue, read
+/// through Roon's official API. `status` is `next`, `last` or `unknown`; `for_title` is the track that was
+/// playing when the queue was read. Lives here (not in `api`) because the adapter-boundary lint only allows
+/// direct access to the Roon adapter from the adapters folder and `main.rs`.
+pub async fn queue_next_handler(
+    axum::extract::State(state): axum::extract::State<crate::api::AppState>,
+    axum::extract::Path(zone_id): axum::extract::Path<String>,
+) -> axum::Json<QueueNextView> {
+    axum::Json(state.roon.queue_next_for(&zone_id).await)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
