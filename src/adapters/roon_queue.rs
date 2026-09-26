@@ -129,7 +129,6 @@ impl QueueNextView {
     }
 }
 
-
 /// `GET /roon/zone/:zone_id/queue_next` - what follows the playing track in the zone's real queue, read
 /// through Roon's official API. `status` is `next`, `last` or `unknown`; `for_title` is the track that was
 /// playing when the queue was read. Lives here (not in `api`) because the adapter-boundary lint only allows
@@ -154,7 +153,11 @@ mod tests {
 
     #[test]
     fn next_is_the_item_after_the_playing_one() {
-        let items = [track("Bloody Well Right", "Supertramp"), track("Hide In Your Shell", "Supertramp"), track("Asylum", "Supertramp")];
+        let items = [
+            track("Bloody Well Right", "Supertramp"),
+            track("Hide In Your Shell", "Supertramp"),
+            track("Asylum", "Supertramp"),
+        ];
         assert_eq!(
             next_after_current(&items, "Bloody Well Right"),
             QueueNext::Next(track("Hide In Your Shell", "Supertramp"))
@@ -163,8 +166,15 @@ mod tests {
 
     #[test]
     fn playing_item_is_found_wherever_it_sits_in_the_window() {
-        let items = [track("Earlier", "A"), track("Now", "B"), track("Later", "C")];
-        assert_eq!(next_after_current(&items, "Now"), QueueNext::Next(track("Later", "C")));
+        let items = [
+            track("Earlier", "A"),
+            track("Now", "B"),
+            track("Later", "C"),
+        ];
+        assert_eq!(
+            next_after_current(&items, "Now"),
+            QueueNext::Next(track("Later", "C"))
+        );
     }
 
     #[test]
@@ -180,7 +190,10 @@ mod tests {
     fn last_item_of_a_short_queue_means_nothing_follows() {
         let items = [track("Only", "A"), track("Two", "B")];
         assert_eq!(next_after_current(&items, "Two"), QueueNext::Last);
-        assert_eq!(next_after_current(&[track("Only", "A")], "Only"), QueueNext::Last);
+        assert_eq!(
+            next_after_current(&[track("Only", "A")], "Only"),
+            QueueNext::Last
+        );
     }
 
     #[test]
@@ -192,7 +205,10 @@ mod tests {
     #[test]
     fn playing_item_missing_from_the_window_is_unknown_not_a_guess() {
         let items = [track("A", "x"), track("B", "x")];
-        assert_eq!(next_after_current(&items, "Something else"), QueueNext::Unknown);
+        assert_eq!(
+            next_after_current(&items, "Something else"),
+            QueueNext::Unknown
+        );
         assert_eq!(next_after_current(&[], "Now"), QueueNext::Unknown);
     }
 
@@ -205,11 +221,26 @@ mod tests {
             fetched_at: now,
         };
         let v = QueueNextView::from_entry("z", &entry(QueueNext::Next(track("T", "A"))), now);
-        assert_eq!((v.status, v.next_title.as_deref(), v.next_artist.as_deref()), ("next", Some("T"), Some("A")));
-        assert_eq!(QueueNextView::from_entry("z", &entry(QueueNext::Last), now).status, "last");
-        assert_eq!(QueueNextView::from_entry("z", &entry(QueueNext::Unknown), now).status, "unknown");
-        let stale = QueueNextEntry { fetched_at: now, ..entry(QueueNext::Last) };
+        assert_eq!(
+            (v.status, v.next_title.as_deref(), v.next_artist.as_deref()),
+            ("next", Some("T"), Some("A"))
+        );
+        assert_eq!(
+            QueueNextView::from_entry("z", &entry(QueueNext::Last), now).status,
+            "last"
+        );
+        assert_eq!(
+            QueueNextView::from_entry("z", &entry(QueueNext::Unknown), now).status,
+            "unknown"
+        );
+        let stale = QueueNextEntry {
+            fetched_at: now,
+            ..entry(QueueNext::Last)
+        };
         let later = now + QUEUE_NEXT_MAX_AGE + Duration::from_secs(1);
-        assert_eq!(QueueNextView::from_entry("z", &stale, later), QueueNextView::unknown("z"));
+        assert_eq!(
+            QueueNextView::from_entry("z", &stale, later),
+            QueueNextView::unknown("z")
+        );
     }
 }

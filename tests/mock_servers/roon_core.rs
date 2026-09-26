@@ -1006,7 +1006,14 @@ impl FakeRoonCore {
         let push = self.state.read().await.zone_push.clone();
         if let Some((sub_req_id, sub_writer)) = push {
             let change = json!({ "zones_changed": [zone] });
-            send(&sub_writer, "CONTINUE", "Changed", sub_req_id, Some(&change)).await;
+            send(
+                &sub_writer,
+                "CONTINUE",
+                "Changed",
+                sub_req_id,
+                Some(&change),
+            )
+            .await;
         }
     }
 
@@ -1531,7 +1538,11 @@ async fn handle_request(
             let items: Vec<Value> = {
                 let mut st = core.write().await;
                 st.queue_requests.push(wanted);
-                st.queue_items.iter().take(wanted as usize).cloned().collect()
+                st.queue_items
+                    .iter()
+                    .take(wanted as usize)
+                    .cloned()
+                    .collect()
             };
             respond(
                 &core,
@@ -2237,7 +2248,10 @@ fn contains(state: &CoreState, parent: usize, needle: usize) -> bool {
 
 fn search(state: &CoreState, source: &str, query: &str) -> Vec<usize> {
     let query = query.to_lowercase();
-    let words: Vec<&str> = query.split_whitespace().filter(|w| w.chars().count() >= 3).collect();
+    let words: Vec<&str> = query
+        .split_whitespace()
+        .filter(|w| w.chars().count() >= 3)
+        .collect();
     let word_match = state.arena.word_match;
     state
         .arena

@@ -88,6 +88,36 @@ tool_box!(
     ]
 );
 
+/// Environment variable naming MCP tools to withhold from clients.
+///
+/// A comma-separated list of tool names. Empty or unset (the default) hides
+/// nothing. An operator uses it to narrow the surface a small voice model can
+/// choose from, for example so a title request can only take the guarded
+/// `hifi_play` path.
+pub const HIDDEN_TOOLS_ENV: &str = "UHC_MCP_HIDDEN_TOOLS";
+
+/// Parse a hidden-tools list: comma-separated, whitespace and empties ignored.
+pub fn parse_hidden_tools(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Tool names the operator has hidden (see [`HIDDEN_TOOLS_ENV`]).
+pub fn hidden_tools() -> Vec<String> {
+    std::env::var(HIDDEN_TOOLS_ENV)
+        .map(|raw| parse_hidden_tools(&raw))
+        .unwrap_or_default()
+}
+
+/// Drop every tool named in `hidden` from `tools`.
+pub fn without_hidden(mut tools: Vec<Tool>, hidden: &[String]) -> Vec<Tool> {
+    tools.retain(|t| !hidden.iter().any(|h| h == &t.name));
+    tools
+}
+
 /// Every tool name, as a `'static` string.
 ///
 /// `HifiTools::tools()` yields owned `String`s, but the envelope's `tool` field is
@@ -298,6 +328,24 @@ fn apply_schema_overrides(tools: &mut [Tool]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_tools_list_parses_and_filters() {
+        assert!(parse_hidden_tools("").is_empty());
+        assert_eq!(
+            parse_hidden_tools(" hifi_search, ,hifi_play_ref,"),
+            vec!["hifi_search".to_string(), "hifi_play_ref".to_string()]
+        );
+        let hidden = parse_hidden_tools("hifi_search,hifi_play_ref,hifi_collections");
+        let kept = without_hidden(list_tools(true), &hidden);
+        assert_eq!(kept.len(), list_tools(true).len() - 3);
+        assert!(kept.iter().all(|t| !hidden.contains(&t.name)));
+        assert!(kept.iter().any(|t| t.name == "hifi_play"));
+        assert_eq!(
+            without_hidden(list_tools(true), &[]).len(),
+            list_tools(true).len()
+        );
+    }
 
     #[test]
     fn advertises_nineteen_tools_when_hqplayer_is_enabled() {

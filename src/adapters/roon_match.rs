@@ -10,10 +10,50 @@
 
 /// Words that describe the *kind* of thing wanted rather than which thing. Not required to match.
 const GENERIC: &[&str] = &[
-    "a", "an", "the", "of", "and", "or", "in", "on", "to", "for", "with", "by", "from", "at", "my", "some",
-    "play", "best", "greatest", "hits", "hit", "collection", "complete", "essential", "essentials", "ultimate",
-    "very", "songs", "song", "music", "album", "albums", "track", "tracks", "live", "deluxe", "edition",
-    "remaster", "remastered", "version", "vol", "volume", "disc", "cd",
+    "a",
+    "an",
+    "the",
+    "of",
+    "and",
+    "or",
+    "in",
+    "on",
+    "to",
+    "for",
+    "with",
+    "by",
+    "from",
+    "at",
+    "my",
+    "some",
+    "play",
+    "best",
+    "greatest",
+    "hits",
+    "hit",
+    "collection",
+    "complete",
+    "essential",
+    "essentials",
+    "ultimate",
+    "very",
+    "songs",
+    "song",
+    "music",
+    "album",
+    "albums",
+    "track",
+    "tracks",
+    "live",
+    "deluxe",
+    "edition",
+    "remaster",
+    "remastered",
+    "version",
+    "vol",
+    "volume",
+    "disc",
+    "cd",
 ];
 
 /// `[[41082|Bob Marley & The Wailers]]` -> `Bob Marley & The Wailers` (any number of them in a string).
@@ -165,7 +205,8 @@ pub fn roon_search_input(query: &str) -> String {
     let cleaned: String = query
         .chars()
         .map(|c| match c {
-            '\u{2013}' | '\u{2014}' | '\u{2012}' | '!' | '?' | ':' | ';' | ',' | '"' | '(' | ')' | '[' | ']' => ' ',
+            '\u{2013}' | '\u{2014}' | '\u{2012}' | '!' | '?' | ':' | ';' | ',' | '"' | '('
+            | ')' | '[' | ']' => ' ',
             '\u{2019}' => '\'',
             other => other,
         })
@@ -180,7 +221,11 @@ pub fn roon_search_input(query: &str) -> String {
         .copied()
         .filter(|w| !w.eq_ignore_ascii_case("by"))
         .collect();
-    let kept = if without_by.is_empty() { words } else { without_by };
+    let kept = if without_by.is_empty() {
+        words
+    } else {
+        without_by
+    };
     let out = kept.join(" ");
     if out.is_empty() {
         query.to_string()
@@ -213,13 +258,37 @@ mod tests {
 
     #[test]
     fn real_matches_are_accepted() {
-        assert!(candidate_matches("The Best of Goldfrapp", "The Singles", Some("[[7|Goldfrapp]]")));
+        assert!(candidate_matches(
+            "The Best of Goldfrapp",
+            "The Singles",
+            Some("[[7|Goldfrapp]]")
+        ));
         assert!(candidate_matches("Goldfrapp", "Goldfrapp", None));
-        assert!(candidate_matches("Goldfrapp Supernature", "Supernature", Some("[[7|Goldfrapp]]")));
-        assert!(candidate_matches("Kind of Blue", "Kind of Blue", Some("[[1|Miles Davis]]")));
-        assert!(candidate_matches("Miles Davis Kind of Blue", "Kind of Blue", Some("[[1|Miles Davis]]")));
-        assert!(candidate_matches("Dark Side of the Moon", "The Dark Side of the Moon", Some("Pink Floyd")));
-        assert!(candidate_matches("Bob Marley Legend", "Legend \u{2013} The Best Of Bob Marley & The Wailers", None));
+        assert!(candidate_matches(
+            "Goldfrapp Supernature",
+            "Supernature",
+            Some("[[7|Goldfrapp]]")
+        ));
+        assert!(candidate_matches(
+            "Kind of Blue",
+            "Kind of Blue",
+            Some("[[1|Miles Davis]]")
+        ));
+        assert!(candidate_matches(
+            "Miles Davis Kind of Blue",
+            "Kind of Blue",
+            Some("[[1|Miles Davis]]")
+        ));
+        assert!(candidate_matches(
+            "Dark Side of the Moon",
+            "The Dark Side of the Moon",
+            Some("Pink Floyd")
+        ));
+        assert!(candidate_matches(
+            "Bob Marley Legend",
+            "Legend \u{2013} The Best Of Bob Marley & The Wailers",
+            None
+        ));
     }
 
     #[test]
@@ -239,7 +308,10 @@ mod tests {
 
     #[test]
     fn markup_is_cleaned() {
-        assert_eq!(clean_markup("[[41082|Bob Marley & The Wailers]]"), "Bob Marley & The Wailers");
+        assert_eq!(
+            clean_markup("[[41082|Bob Marley & The Wailers]]"),
+            "Bob Marley & The Wailers"
+        );
         assert_eq!(clean_markup("a [[1|B]] and [[2|C]] d"), "a B and C d");
         assert_eq!(clean_markup("[[broken"), "[[broken");
         assert_eq!(clean_markup("plain"), "plain");
@@ -252,18 +324,30 @@ mod tests {
 
     #[test]
     fn the_roon_search_input_drops_filler_and_punctuation() {
-        assert_eq!(roon_search_input("The Singles by Goldfrapp"), "The Singles Goldfrapp");
-        assert_eq!(roon_search_input("GRRR! by The Rolling Stones"), "GRRR The Rolling Stones");
+        assert_eq!(
+            roon_search_input("The Singles by Goldfrapp"),
+            "The Singles Goldfrapp"
+        );
+        assert_eq!(
+            roon_search_input("GRRR! by The Rolling Stones"),
+            "GRRR The Rolling Stones"
+        );
         assert_eq!(roon_search_input("1 by The Beatles"), "1 The Beatles");
         assert_eq!(
             roon_search_input("Jump Back: The Best of The Rolling Stones '71\u{2013}'93"),
             "Jump Back The Best of The Rolling Stones 71 93"
         );
-        assert_eq!(roon_search_input("Don't Stop by Fleetwood Mac"), "Don't Stop Fleetwood Mac");
+        assert_eq!(
+            roon_search_input("Don't Stop by Fleetwood Mac"),
+            "Don't Stop Fleetwood Mac"
+        );
         // A query that is only "by", or nothing usable, is left alone rather than emptied.
         assert_eq!(roon_search_input("by"), "by");
         assert_eq!(roon_search_input("!!!"), "!!!");
         // Ordinary queries are untouched.
-        assert_eq!(roon_search_input("Kind of Blue Miles Davis"), "Kind of Blue Miles Davis");
+        assert_eq!(
+            roon_search_input("Kind of Blue Miles Davis"),
+            "Kind of Blue Miles Davis"
+        );
     }
 }

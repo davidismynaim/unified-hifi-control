@@ -32,8 +32,7 @@ use std::time::{Duration, Instant};
 
 use mock_servers::roon_core::{
     album, album_live, artist_live, default_zone, playlist, playlist_live, radio_station,
-    zone_with_grouping,
-    FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
+    zone_with_grouping, FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
 };
 use roon_api::browse::{BrowseOpts, LoadOpts};
 use unified_hifi_control::adapters::roon::{
@@ -364,7 +363,10 @@ async fn real_queue_next_track_is_read_through_the_official_api_and_follows_the_
     assert_eq!(view.next_title.as_deref(), Some("Hide In Your Shell"));
     assert_eq!(view.next_artist.as_deref(), Some("Supertramp"));
     let asked = core.queue_requests().await;
-    assert!(!asked.is_empty() && asked.iter().all(|n| *n <= 3), "asked for too much: {asked:?}");
+    assert!(
+        !asked.is_empty() && asked.iter().all(|n| *n <= 3),
+        "asked for too much: {asked:?}"
+    );
 
     // The track changes: the queue is read again and the answer follows it.
     core.push_zone_changed(playing_zone("zone_q", "Hide In Your Shell", 6))
@@ -381,16 +383,20 @@ async fn real_queue_next_track_is_read_through_the_official_api_and_follows_the_
 #[tokio::test]
 async fn real_queue_next_track_is_unknown_when_it_cannot_be_established() {
     let core = FakeRoonCore::start().await;
-    core.set_zones(vec![playing_zone("zone_q", "Playing", 1)]).await;
-    core.set_queue_items(vec![queue_item(9, "Some other track", "X")]).await;
+    core.set_zones(vec![playing_zone("zone_q", "Playing", 1)])
+        .await;
+    core.set_queue_items(vec![queue_item(9, "Some other track", "X")])
+        .await;
     let adapter = connected(&core).await;
     let view = wait_for_queue_status(&adapter, "zone_q", "unknown", "Playing").await;
     assert_eq!(view.status, "unknown");
     assert_eq!(view.for_title.as_deref(), Some("Playing"));
     assert!(view.next_title.is_none());
 
-    core.set_queue_items(vec![queue_item(1, "Playing", "X")]).await;
-    core.push_zone_changed(playing_zone("zone_q", "Playing", 0)).await;
+    core.set_queue_items(vec![queue_item(1, "Playing", "X")])
+        .await;
+    core.push_zone_changed(playing_zone("zone_q", "Playing", 0))
+        .await;
     let view = wait_for_queue_status(&adapter, "zone_q", "last", "Playing").await;
     assert_eq!(view.status, "last", "end of queue not recognised: {view:?}");
 
@@ -1249,10 +1255,12 @@ async fn a_top_hit_by_the_wrong_artist_is_refused_and_nothing_is_played() {
     library.word_match_search = true; // like Roon: any word of the query can match
     library.search_results.insert(
         "Library".to_string(),
-        vec![FakeItem::list("Legend \u{2013} The Best Of Bob Marley & The Wailers")
-            .with_subtitle("[[41082|Bob Marley & The Wailers]]")
-            .with_children(vec![FakeItem::action_list("Play Album")
-                .with_children(vec![FakeItem::action("Play Now")])])],
+        vec![
+            FakeItem::list("Legend \u{2013} The Best Of Bob Marley & The Wailers")
+                .with_subtitle("[[41082|Bob Marley & The Wailers]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+        ],
     );
     let core = FakeRoonCore::start_with(library).await;
     let adapter = connected(&core).await;
@@ -1269,8 +1277,14 @@ async fn a_top_hit_by_the_wrong_artist_is_refused_and_nothing_is_played() {
     let text = error.to_string();
     assert!(text.contains("No confident match"), "got {text}");
     assert!(text.contains("nothing played"), "got {text}");
-    assert!(text.contains("Bob Marley"), "should name what Roon offered: {text}");
-    assert!(text.contains("goldfrapp"), "should name the missing word: {text}");
+    assert!(
+        text.contains("Bob Marley"),
+        "should name what Roon offered: {text}"
+    );
+    assert!(
+        text.contains("goldfrapp"),
+        "should name the missing word: {text}"
+    );
 
     let invoked = core.browsed_titles().await;
     assert!(
@@ -1315,7 +1329,8 @@ async fn a_matching_result_is_chosen_over_a_higher_ranked_unrelated_one() {
 
     let invoked = core.browsed_titles().await;
     assert!(
-        invoked.contains(&"The Singles".to_string()) && !invoked.iter().any(|t| t.contains("Bob Marley")),
+        invoked.contains(&"The Singles".to_string())
+            && !invoked.iter().any(|t| t.contains("Bob Marley")),
         "must navigate into the Goldfrapp album only: {invoked:?}"
     );
 
@@ -1350,10 +1365,19 @@ async fn a_track_by_the_right_artist_is_not_the_album_that_was_asked_for() {
         .expect_err("GRRR! is not in the library; the track must not be played instead");
     let text = error.to_string();
     assert!(text.contains("nothing played"), "got {text}");
-    assert!(text.contains("grrr"), "should name the missing word: {text}");
-    assert!(text.contains("Live By The Sword"), "should name what Roon offered: {text}");
     assert!(
-        !core.browsed_titles().await.contains(&"Play Now".to_string()),
+        text.contains("grrr"),
+        "should name the missing word: {text}"
+    );
+    assert!(
+        text.contains("Live By The Sword"),
+        "should name what Roon offered: {text}"
+    );
+    assert!(
+        !core
+            .browsed_titles()
+            .await
+            .contains(&"Play Now".to_string()),
         "nothing may be played"
     );
 

@@ -2,6 +2,11 @@
 //!
 //! Connects to Roon Core via SOOD discovery and WebSocket protocol.
 
+use super::roon_match;
+use super::roon_queue::{
+    next_after_current, QueueNext, QueueNextEntry, QueueNextView, QueueTrack, QUEUE_LOOK_AHEAD,
+    QUEUE_READ_TIMEOUT, QUEUE_REFRESH,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use roon_api::{
@@ -21,11 +26,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
-use super::roon_match;
-use super::roon_queue::{
-    next_after_current, QueueNext, QueueNextEntry, QueueNextView, QueueTrack, QUEUE_LOOK_AHEAD,
-    QUEUE_READ_TIMEOUT, QUEUE_REFRESH,
-};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock, Semaphore};
 use tokio::time::timeout_at;
 use tokio_util::sync::CancellationToken;
@@ -2854,10 +2854,11 @@ impl RoonAdapter {
 
         // Find first playable item - but only one that really matches the query. Roon matches the WORDS of a
         // query against titles, so "The Best of Goldfrapp" ranks Bob Marley's "The Best Of" compilation first.
-        if let Some(playable) = find_playable_item(&search_results.items).filter(|p| {
-            roon_match::candidate_matches(query, &p.title, p.subtitle.as_deref())
-        }) {
-            let playable_title = roon_match::display_title(&playable.title, playable.subtitle.as_deref());
+        if let Some(playable) = find_playable_item(&search_results.items)
+            .filter(|p| roon_match::candidate_matches(query, &p.title, p.subtitle.as_deref()))
+        {
+            let playable_title =
+                roon_match::display_title(&playable.title, playable.subtitle.as_deref());
             let playable_key = playable
                 .item_key
                 .clone()
@@ -2876,7 +2877,13 @@ impl RoonAdapter {
 
         // Try navigating deeper
         if let Some(result) = self
-            .try_navigate_to_playable(query, &session_key, bare_zone_id, &search_results.items, action)
+            .try_navigate_to_playable(
+                query,
+                &session_key,
+                bare_zone_id,
+                &search_results.items,
+                action,
+            )
             .await?
         {
             return Ok(result);
@@ -2884,7 +2891,13 @@ impl RoonAdapter {
 
         // Try category fallback
         if let Some(result) = self
-            .try_category_playable(query, &session_key, bare_zone_id, &search_results.items, action)
+            .try_category_playable(
+                query,
+                &session_key,
+                bare_zone_id,
+                &search_results.items,
+                action,
+            )
             .await?
         {
             return Ok(result);
@@ -3027,9 +3040,9 @@ impl RoonAdapter {
             })
             .await?;
 
-        if let Some(playable) = find_playable_item(&category_items.items).filter(|p| {
-            roon_match::candidate_matches(query, &p.title, p.subtitle.as_deref())
-        }) {
+        if let Some(playable) = find_playable_item(&category_items.items)
+            .filter(|p| roon_match::candidate_matches(query, &p.title, p.subtitle.as_deref()))
+        {
             let title = roon_match::display_title(&playable.title, playable.subtitle.as_deref());
             let key = playable
                 .item_key
@@ -4349,7 +4362,9 @@ async fn read_queue_next(state: &Arc<RwLock<RoonState>>, zone_id: &str) {
         if !s.connected || s.pending_queue.is_some() {
             return;
         }
-        let Some(transport) = s.transport.clone() else { return };
+        let Some(transport) = s.transport.clone() else {
+            return;
+        };
         let Some(title) = s
             .zones
             .get(zone_id)
