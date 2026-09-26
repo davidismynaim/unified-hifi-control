@@ -864,11 +864,36 @@ pub async fn handle_play(
                 .param("source", roon_source_name(source))
                 .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
 
-            match state
+            let first = state
                 .roon
                 .search_and_play(&args.query, &args.zone_id, source, action)
-                .await
-            {
+                .await;
+            let result = match first {
+                // Nothing in the library matched the request and the caller did not name a source: try the
+                // streaming source before giving up, so an album that only exists on Qobuz is played rather
+                // than refused. If that also fails (or Qobuz is not set up) the library refusal is reported.
+                Err(e)
+                    if args.source.is_none()
+                        && matches!(source, crate::adapters::roon::SearchSource::Library)
+                        && e.downcast_ref::<crate::adapters::roon::NoConfidentMatch>().is_some() =>
+                {
+                    match state
+                        .roon
+                        .search_and_play(
+                            &args.query,
+                            &args.zone_id,
+                            crate::adapters::roon::SearchSource::Qobuz,
+                            action,
+                        )
+                        .await
+                    {
+                        Ok(message) => Ok(format!("{message} (from Qobuz)")),
+                        Err(_) => Err(e),
+                    }
+                }
+                other => other,
+            };
+            match result {
                 Ok(message) => Ok(play_success(state, env, message).await),
                 Err(e) => env.failed(format!("Play error: {}", e)),
             }

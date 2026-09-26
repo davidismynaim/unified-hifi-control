@@ -155,6 +155,40 @@ pub fn display_title(title: &str, subtitle: Option<&str>) -> String {
     }
 }
 
+/// The text actually sent to Roon's search box. Roon ranks a search word by word, so spoken-style filler
+/// ruins it: "The Singles by Goldfrapp" returned the New Order track "Touched by the Hand of God" (it contains
+/// "by" and "the") while "The Singles Goldfrapp" returned Goldfrapp's album first. This drops a standalone
+/// "by" (when other words remain), turns dashes and punctuation such as `!`, `:` and quotes into spaces
+/// ("GRRR!" -> "GRRR", "'71\u{2013}'93" -> "71 93") and squeezes whitespace. Apostrophes inside words are kept
+/// ("Don't"). If nothing would be left, the original is returned unchanged.
+pub fn roon_search_input(query: &str) -> String {
+    let cleaned: String = query
+        .chars()
+        .map(|c| match c {
+            '\u{2013}' | '\u{2014}' | '\u{2012}' | '!' | '?' | ':' | ';' | ',' | '"' | '(' | ')' | '[' | ']' => ' ',
+            '\u{2019}' => '\'',
+            other => other,
+        })
+        .collect();
+    let words: Vec<&str> = cleaned
+        .split_whitespace()
+        .map(|w| w.trim_matches('\''))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let without_by: Vec<&str> = words
+        .iter()
+        .copied()
+        .filter(|w| !w.eq_ignore_ascii_case("by"))
+        .collect();
+    let kept = if without_by.is_empty() { words } else { without_by };
+    let out = kept.join(" ");
+    if out.is_empty() {
+        query.to_string()
+    } else {
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,5 +248,22 @@ mod tests {
             "Legend - Bob Marley & The Wailers"
         );
         assert_eq!(display_title("Goldfrapp", None), "Goldfrapp");
+    }
+
+    #[test]
+    fn the_roon_search_input_drops_filler_and_punctuation() {
+        assert_eq!(roon_search_input("The Singles by Goldfrapp"), "The Singles Goldfrapp");
+        assert_eq!(roon_search_input("GRRR! by The Rolling Stones"), "GRRR The Rolling Stones");
+        assert_eq!(roon_search_input("1 by The Beatles"), "1 The Beatles");
+        assert_eq!(
+            roon_search_input("Jump Back: The Best of The Rolling Stones '71\u{2013}'93"),
+            "Jump Back The Best of The Rolling Stones 71 93"
+        );
+        assert_eq!(roon_search_input("Don't Stop by Fleetwood Mac"), "Don't Stop Fleetwood Mac");
+        // A query that is only "by", or nothing usable, is left alone rather than emptied.
+        assert_eq!(roon_search_input("by"), "by");
+        assert_eq!(roon_search_input("!!!"), "!!!");
+        // Ordinary queries are untouched.
+        assert_eq!(roon_search_input("Kind of Blue Miles Davis"), "Kind of Blue Miles Davis");
     }
 }

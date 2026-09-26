@@ -195,6 +195,18 @@ fn find_playable_item(items: &[BrowseItem]) -> Option<&BrowseItem> {
 /// The refusal returned when nothing in Roon's results matches what was asked for. It names the closest
 /// results and the words that were missing, so the caller can search properly (`hifi_search`) instead of
 /// being told something was played that was not.
+/// Marker error so callers (`hifi_play`) can tell "nothing matched" from a real failure and try another source.
+#[derive(Debug)]
+pub struct NoConfidentMatch(pub String);
+
+impl std::fmt::Display for NoConfidentMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoConfidentMatch {}
+
 fn no_confident_match(query: &str, items: &[BrowseItem]) -> anyhow::Error {
     let closest: Vec<String> = items
         .iter()
@@ -207,7 +219,7 @@ fn no_confident_match(query: &str, items: &[BrowseItem]) -> anyhow::Error {
         .find(|item| !is_category(item))
         .map(|item| roon_match::missing_tokens(query, &item.title, item.subtitle.as_deref()))
         .unwrap_or_default();
-    anyhow::anyhow!(
+    anyhow::Error::new(NoConfidentMatch(format!(
         "No confident match for '{query}': nothing played. Roon's closest results were [{}]{}. \
          Do not assume anything is playing. Search with hifi_search for the exact title and artist, or \
          say that it could not be found.",
@@ -217,7 +229,7 @@ fn no_confident_match(query: &str, items: &[BrowseItem]) -> anyhow::Error {
         } else {
             format!(" and none contains '{}'", missing.join("', '"))
         }
-    )
+    )))
 }
 
 /// Check if an item is a category (Albums, Tracks, etc.) rather than playable content
@@ -2826,7 +2838,7 @@ impl RoonAdapter {
         self.browse(BrowseOpts {
             multi_session_key: Some(session_key.clone()),
             item_key: Some(search_key),
-            input: Some(query.to_string()),
+            input: Some(roon_match::roon_search_input(query)),
             zone_or_output_id: Some(bare_zone_id.to_string()),
             ..Default::default()
         })
