@@ -109,6 +109,9 @@ pub struct HifiPlayTool {
     /// What to do: "play" (default), "queue", or "radio". radio is Roon-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
+    /// Roon only. "album" when the request says album, "track" when it says song or track; leave unset otherwise (an album is assumed: a matching album is preferred over a same-named track). An explicit kind never plays the other kind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 /// Play, queue, or start radio from a specific `hifi_search` result (#396)
@@ -864,9 +867,14 @@ pub async fn handle_play(
                 .param("source", roon_source_name(source))
                 .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
 
+            let kind = match args.kind.as_deref() {
+                Some("track" | "song") => crate::adapters::roon::PlayKind::Track,
+                Some("album") => crate::adapters::roon::PlayKind::Album,
+                _ => crate::adapters::roon::PlayKind::Auto,
+            };
             let result = state
                 .roon
-                .search_and_play(&args.query, &args.zone_id, source, action)
+                .search_and_play_kind(&args.query, &args.zone_id, source, action, kind)
                 .await;
             match result {
                 Ok(message) => Ok(play_success(state, env, message).await),

@@ -2263,6 +2263,13 @@ fn search(state: &CoreState, source: &str, query: &str) -> Vec<usize> {
                 .copied()
                 .filter(|&index| {
                     let node = &state.arena.nodes[index];
+                    // Like Roon, results carry grouping rows ("Albums (N results)") whatever the query says.
+                    if matches!(
+                        node.title.as_str(),
+                        "Albums" | "Tracks" | "Artists" | "Works"
+                    ) {
+                        return true;
+                    }
                     if word_match {
                         let hay = format!(
                             "{} {}",

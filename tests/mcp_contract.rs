@@ -800,6 +800,7 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("zone_id", true),
             ("source", false),
             ("action", false),
+            ("kind", false),
         ],
     ),
     ("hifi_status", &[]),

@@ -186,6 +186,20 @@ pub fn candidate_matches(query: &str, title: &str, subtitle: Option<&str>) -> bo
     missing_tokens(query, title, subtitle).is_empty()
 }
 
+/// True when every word of an album's own title appears in the query ("Pink Floyd Wish You Were Here"
+/// contains all of "Wish You Were Here"; "Wish You Were Here 50" does not, because of the "50").
+/// Used to prefer a real album over a same-named track or karaoke row that Roon ranks first.
+pub fn title_fits_query(query: &str, title: &str) -> bool {
+    let title_tokens = tokens(&clean_markup(title));
+    if title_tokens.is_empty() {
+        return false;
+    }
+    let wanted = tokens(query);
+    title_tokens
+        .iter()
+        .all(|t| wanted.iter().any(|w| token_matches(w, t)))
+}
+
 /// `Title - Artist` for messages back to the caller (markup removed).
 pub fn display_title(title: &str, subtitle: Option<&str>) -> String {
     let t = clean_markup(title);

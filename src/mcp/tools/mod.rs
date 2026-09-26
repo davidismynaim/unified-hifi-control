@@ -169,7 +169,7 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
         "hifi_capabilities" => &["zone_id"],
         "hifi_control" => &["zone_id", "action", "value"],
         "hifi_search" => &["query", "zone_id", "source"],
-        "hifi_play" => &["query", "zone_id", "source", "action"],
+        "hifi_play" => &["query", "zone_id", "source", "action", "kind"],
         "hifi_play_ref" => &["ref", "zone_id", "action"],
         "hifi_queue" => &["zone_id", "action", "item_id", "position", "target_zone_id"],
         "hifi_collections" => &[

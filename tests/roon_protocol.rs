@@ -1337,6 +1337,133 @@ async fn a_matching_result_is_chosen_over_a_higher_ranked_unrelated_one() {
     core.stop().await;
 }
 
+/// The Wish You Were Here failure: the artist-prefixed query made Roon rank a Various Artists TRACK literally
+/// titled "Pink Floyd Wish You Were Here" first, and it matched every word, so it was played. The Pink Floyd
+/// album sits in the Albums category and must win; `PlayKind::Track` (a single song was asked for) keeps the
+/// old top-hit behaviour.
+fn wish_you_were_here_library() -> FakeLibrary {
+    let mut library = FakeLibrary::standard();
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![
+            FakeItem::action_list("Pink Floyd Wish You Were Here")
+                .with_subtitle("Various Artists")
+                .with_children(vec![FakeItem::action("Play Now")]),
+            FakeItem::list("Tracks").with_children(vec![FakeItem::action_list(
+                "Wish You Were Here",
+            )
+            .with_subtitle("[[1|Pink Floyd]]")
+            .with_children(vec![FakeItem::action("Play Now")])]),
+            FakeItem::list("Albums").with_children(vec![
+                FakeItem::list("Wish You Were Here 50")
+                    .with_subtitle("[[1|Pink Floyd]]")
+                    .with_children(vec![FakeItem::action_list("Play Album")
+                        .with_children(vec![FakeItem::action("Play Now")])]),
+                FakeItem::list("Wish You Were Here")
+                    .with_subtitle("[[1|Pink Floyd]]")
+                    .with_children(vec![FakeItem::action_list("Play Album")
+                        .with_children(vec![FakeItem::action("Play Now")])]),
+            ]),
+        ],
+    );
+    library
+}
+
+#[tokio::test]
+async fn an_album_whose_title_is_in_the_query_beats_a_same_named_track() {
+    for query in ["Pink Floyd Wish You Were Here", "Wish You Were Here"] {
+        let core = FakeRoonCore::start_with(wish_you_were_here_library()).await;
+        let adapter = connected(&core).await;
+
+        let message = adapter
+            .search_and_play(
+                query,
+                "roon:zone_fake_1",
+                SearchSource::Library,
+                PlayAction::Play,
+            )
+            .await
+            .expect("the album is in the results");
+        assert_eq!(
+            message, "Play Now: Wish You Were Here - Pink Floyd",
+            "{query}"
+        );
+
+        core.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn kind_album_plays_the_album_and_never_a_track() {
+    let core = FakeRoonCore::start_with(wish_you_were_here_library()).await;
+    let adapter = connected(&core).await;
+    let message = adapter
+        .search_and_play_kind(
+            "Wish You Were Here Pink Floyd",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+            unified_hifi_control::adapters::roon::PlayKind::Album,
+        )
+        .await
+        .expect("the album is in the Albums list");
+    assert_eq!(message, "Play Now: Wish You Were Here - Pink Floyd");
+    assert!(core
+        .browsed_titles()
+        .await
+        .contains(&"Play Album".to_string()));
+    core.stop().await;
+
+    // No album in the results at all: refuse rather than play the track.
+    let mut library = FakeLibrary::standard();
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![FakeItem::action_list("Arrival")
+            .with_subtitle("[[2|ABBA]]")
+            .with_children(vec![FakeItem::action("Play Now")])],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+    let error = adapter
+        .search_and_play_kind(
+            "Arrival ABBA",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+            unified_hifi_control::adapters::roon::PlayKind::Album,
+        )
+        .await
+        .expect_err("an explicit album request must not play a track");
+    assert!(error.to_string().contains("No confident match"), "{error}");
+    core.stop().await;
+}
+
+#[tokio::test]
+async fn kind_track_plays_the_song_from_the_tracks_list_not_an_album() {
+    let core = FakeRoonCore::start_with(wish_you_were_here_library()).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play_kind(
+            "Wish You Were Here Pink Floyd",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+            unified_hifi_control::adapters::roon::PlayKind::Track,
+        )
+        .await
+        .expect("the song is in the Tracks list");
+    assert_eq!(message, "Play Now: Wish You Were Here - Pink Floyd");
+
+    let invoked = core.browsed_titles().await;
+    assert!(
+        !invoked.contains(&"Play Album".to_string()),
+        "a song request must not open an album: {invoked:?}"
+    );
+
+    core.stop().await;
+}
+
 /// Today's Rolling Stones case: the request was the compilation "GRRR!", which is not in the library. Roon's top
 /// hit was a single TRACK by the right artist ("Live By The Sword", on Hackney Diamonds), which used to be played
 /// and announced as GRRR!. A track by the right artist is still not what was asked for: "grrr" is missing.

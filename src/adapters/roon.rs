@@ -195,6 +195,16 @@ fn find_playable_item(items: &[BrowseItem]) -> Option<&BrowseItem> {
 /// The refusal returned when nothing in Roon's results matches what was asked for. It names the closest
 /// results and the words that were missing, so the caller can search properly (`hifi_search`) instead of
 /// being told something was played that was not.
+/// What the caller wants from a query. `Auto` (nothing said) assumes an album: a matching album is preferred over a
+/// same-named track, and only if there is none does the best hit play. `Album` (the request said album) plays an
+/// album or nothing. `Track` (the request said song or track) plays the song from the Tracks list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayKind {
+    Auto,
+    Album,
+    Track,
+}
+
 /// Marker error so callers (`hifi_play`) can tell "nothing matched" from a real failure and try another source.
 #[derive(Debug)]
 pub struct NoConfidentMatch(pub String);
@@ -2760,6 +2770,19 @@ impl RoonAdapter {
         source: SearchSource,
         action: PlayAction,
     ) -> Result<String> {
+        self.search_and_play_kind(query, zone_id, source, action, PlayKind::Auto)
+            .await
+    }
+
+    /// [`Self::search_and_play`] with the caller's say on albums versus tracks.
+    pub async fn search_and_play_kind(
+        &self,
+        query: &str,
+        zone_id: &str,
+        source: SearchSource,
+        action: PlayAction,
+        kind: PlayKind,
+    ) -> Result<String> {
         let session_key = format!(
             "play_{}",
             std::time::SystemTime::now()
@@ -2852,6 +2875,39 @@ impl RoonAdapter {
             })
             .await?;
 
+        // An album whose own title is in the query beats a same-named track: Roon ranks the TRACK
+        // "Pink Floyd Wish You Were Here" (a Various Artists karaoke row) above the Pink Floyd album.
+        // The reverse for a request that said song/track: the Tracks list, not Roon's top hit (which is the album
+        // when the album shares the song's name).
+        let category = if kind == PlayKind::Track {
+            "Tracks"
+        } else {
+            "Albums"
+        };
+        for strict in [true, false] {
+            // Auto assumes an album but may fall back to the best hit; an explicit album/song never plays the
+            // other kind, so it only widens the match (title need not be wholly inside the query) and then refuses.
+            if strict || kind != PlayKind::Auto {
+                if let Some(result) = self
+                    .try_exact_in_category(
+                        category,
+                        strict,
+                        query,
+                        &session_key,
+                        bare_zone_id,
+                        &search_results.items,
+                        action,
+                    )
+                    .await?
+                {
+                    return Ok(result);
+                }
+            }
+        }
+        if kind != PlayKind::Auto {
+            return Err(no_confident_match(query, &search_results.items));
+        }
+
         // Find first playable item - but only one that really matches the query. Roon matches the WORDS of a
         // query against titles, so "The Best of Goldfrapp" ranks Bob Marley's "The Best Of" compilation first.
         if let Some(playable) = find_playable_item(&search_results.items)
@@ -2904,6 +2960,101 @@ impl RoonAdapter {
         }
 
         Err(no_confident_match(query, &search_results.items))
+    }
+
+    /// Play the item of `category` ("Albums" or "Tracks") whose title is contained in the query and whose artist
+    /// matches the rest of it.
+    async fn try_exact_in_category(
+        &self,
+        category: &str,
+        strict: bool,
+        query: &str,
+        session_key: &str,
+        zone_id: &str,
+        items: &[BrowseItem],
+        action: PlayAction,
+    ) -> Result<Option<String>> {
+        let Some(cat_key) = items
+            .iter()
+            .find(|item| item.title == category)
+            .and_then(|item| item.item_key.clone())
+        else {
+            return Ok(None);
+        };
+
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(cat_key),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let albums = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.to_string()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+
+        // Longest fitting title wins (the full album name over a shorter accidental fit); Roon's order breaks ties.
+        let mut best: Option<(&BrowseItem, usize)> = None;
+        for item in &albums.items {
+            if item.item_key.is_none()
+                || !roon_match::candidate_matches(query, &item.title, item.subtitle.as_deref())
+                || (strict && !roon_match::title_fits_query(query, &item.title))
+            {
+                continue;
+            }
+            let weight = roon_match::tokens(&roon_match::clean_markup(&item.title)).len();
+            if best.is_none_or(|(_, w)| weight > w) {
+                best = Some((item, weight));
+            }
+        }
+        let Some((album, _)) = best else {
+            return Ok(None);
+        };
+        let album_title = roon_match::display_title(&album.title, album.subtitle.as_deref());
+        let album_key = album
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Item has no item_key"))?;
+        // A track row is itself playable; an album row has to be opened first.
+        if matches!(
+            album.hint,
+            Some(ItemHint::Action) | Some(ItemHint::ActionList)
+        ) {
+            return Ok(Some(
+                self.execute_play_action(session_key, zone_id, &album_title, &album_key, action)
+                    .await?,
+            ));
+        }
+
+        self.browse(BrowseOpts {
+            multi_session_key: Some(session_key.to_string()),
+            item_key: Some(album_key),
+            zone_or_output_id: Some(zone_id.to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let inner = self
+            .load(LoadOpts {
+                multi_session_key: Some(session_key.to_string()),
+                count: Some(20),
+                ..Default::default()
+            })
+            .await?;
+        let Some(playable) = find_playable_item(&inner.items) else {
+            return Ok(None);
+        };
+        let key = playable
+            .item_key
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+        Ok(Some(
+            self.execute_play_action(session_key, zone_id, &album_title, &key, action)
+                .await?,
+        ))
     }
 
     /// Try to navigate into the first non-category item to find playable content

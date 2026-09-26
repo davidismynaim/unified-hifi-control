@@ -416,6 +416,11 @@
           "nullable": true,
           "type": "string"
         },
+        "kind": {
+          "description": "Roon only. \"album\" when the request says album, \"track\" when it says song or track; leave unset otherwise (an album is assumed: a matching album is preferred over a same-named track). An explicit kind never plays the other kind.",
+          "nullable": true,
+          "type": "string"
+        },
         "query": {
           "description": "What to play (e.g., \"early Michael Jackson\", \"Dark Side of the Moon\")",
           "type": "string"
