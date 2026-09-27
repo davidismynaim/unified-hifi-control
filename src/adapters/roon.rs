@@ -3068,7 +3068,7 @@ impl RoonAdapter {
 
         self.browse(BrowseOpts {
             multi_session_key: Some(session_key.to_string()),
-            item_key: Some(album_key),
+            item_key: Some(album_key.clone()),
             zone_or_output_id: Some(zone_id.to_string()),
             ..Default::default()
         })
@@ -3080,7 +3080,20 @@ impl RoonAdapter {
                 ..Default::default()
             })
             .await?;
+        tracing::warn!(
+            "DEBUG entered {category} item {:?} (key={album_key}) -> inner items = {:?}",
+            album.title,
+            inner
+                .items
+                .iter()
+                .map(|i| (&i.hint, &i.title, &i.item_key))
+                .collect::<Vec<_>>()
+        );
         let Some(playable) = find_playable_item(&inner.items) else {
+            tracing::warn!(
+                "DEBUG: no playable item inside {category} item {:?}",
+                album.title
+            );
             return Ok(None);
         };
         let key = playable
@@ -3927,6 +3940,14 @@ impl RoonAdapter {
                 available
             ));
         };
+        // Whether `matched` actually names the requested verb, versus being a fallback guess (Play's
+        // first-candidate default, or `find_action_item`'s ActionList-descend heuristics) about to be entered on
+        // trust. That distinction matters below: entering a *guessed* item can turn out to directly fire an
+        // action rather than open the menu the guess was hoping for (observed live: "Play Album" on a
+        // multi-disc album immediately started playback instead of opening Play Now/Add Next/Queue/Start
+        // Radio), and when the requested action was not Play, that must not be reported as if it had performed
+        // the right one.
+        let confident = matches!(action, PlayAction::Play) || action.matches_title(&matched.title);
         let verb = matched.title.clone();
         let key = matched
             .item_key
@@ -3934,6 +3955,12 @@ impl RoonAdapter {
             .ok_or_else(|| anyhow::anyhow!("Action has no item_key"))?;
 
         match self.enter_item(session_key, zone_id, &key).await? {
+            None if !confident => Err(anyhow::anyhow!(
+                "Action '{}' not available: the only candidate ('{verb}') turned out to be a direct action, \
+                 not a menu, once entered -- it has already run, but it was a guess, not a match for '{}'",
+                action.canonical_verb(),
+                action.canonical_verb()
+            )),
             None => Ok(format!("{verb}: {item_title}")),
             // Double-nested action_list: `matched` was itself a wrapper
             // (e.g. an inner "Play Album" opening "Play Now"/"Queue"/"Start
