@@ -1438,6 +1438,56 @@ async fn kind_album_plays_the_album_and_never_a_track() {
     core.stop().await;
 }
 
+/// Live reproduction of the Breakfast In America failure: the real album is catalogued as "Breakfast In
+/// America (Deluxe Edition)", and Roon's Albums category surrounds it with many amateur covers/remixes titled
+/// plain "Breakfast in America" (no "Deluxe Edition"). Before the generic-word fix, only the covers passed the
+/// strict title check (the listener never said "deluxe edition"), so one of them won outright in the strict
+/// pass -- the loose pass, where weight would have correctly preferred the fuller official title, never even ran.
+fn breakfast_in_america_library() -> FakeLibrary {
+    let mut library = FakeLibrary::standard();
+    let real_album = FakeItem::list("Breakfast In America (Deluxe Edition)")
+        .with_subtitle("[[1|Supertramp]]")
+        .with_children(vec![FakeItem::action_list("Play Album").with_children(
+            vec![FakeItem::action("Play Now"), FakeItem::action("Queue")],
+        )]);
+    let mut covers = vec![real_album];
+    for artist in ["Viktor Sj\u{f6}berg", "Everlone", "Sho Zoe"] {
+        covers.push(
+            FakeItem::list("Breakfast in America")
+                .with_subtitle(&format!("[[9|{artist}]]"))
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+        );
+    }
+    let albums_category = FakeItem::list("Albums").with_children(covers);
+    library
+        .search_results
+        .insert("Library".to_string(), vec![albums_category]);
+    library
+}
+
+#[tokio::test]
+async fn the_deluxe_edition_beats_the_amateur_covers_surrounding_it() {
+    let core = FakeRoonCore::start_with(breakfast_in_america_library()).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play(
+            "breakfast in america",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+        )
+        .await
+        .expect("the real album is in the results");
+    assert_eq!(
+        message, "Play Now: Breakfast In America (Deluxe Edition) - Supertramp",
+        "got {message}"
+    );
+
+    core.stop().await;
+}
+
 /// Live reproduction of the Arrival/ABBA failure: the "Albums" category's one, unambiguous result is not
 /// the album itself but an editions picker -- one more single-item "List" row repeating the same title -- before
 /// the real action menu ("Play Album" alongside every track). Without descending through it, nothing there

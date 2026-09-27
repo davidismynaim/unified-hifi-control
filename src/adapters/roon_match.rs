@@ -186,18 +186,58 @@ pub fn candidate_matches(query: &str, title: &str, subtitle: Option<&str>) -> bo
     missing_tokens(query, title, subtitle).is_empty()
 }
 
-/// True when every word of an album's own title appears in the query ("Pink Floyd Wish You Were Here"
-/// contains all of "Wish You Were Here"; "Wish You Were Here 50" does not, because of the "50").
-/// Used to prefer a real album over a same-named track or karaoke row that Roon ranks first.
-pub fn title_fits_query(query: &str, title: &str) -> bool {
-    let title_tokens = tokens(&clean_markup(title));
-    if title_tokens.is_empty() {
-        return false;
+/// Ranks how well a candidate in an Albums/Tracks category listing fits `query`, for picking the single best
+/// one in one pass rather than staged "good enough" gates. Three separate live bugs -- Wish You Were Here,
+/// Arrival, Breakfast In America -- turned out to be one design flaw: a strict pass that returned as soon as it
+/// found *anything*, before a later, better-ranked pass got a turn, so a wrong item could win just by clearing
+/// an arbitrary bar first. This replaces that staging.
+///
+/// `None` means the hard gate fails -- some distinctive word of the query (an artist's name, most often) is
+/// simply absent from this candidate at all. That gate is unchanged from [`candidate_matches`] and must never
+/// soften: it is what rejects a top-ranked wrong-artist hit ("The Best of Goldfrapp" ranking Bob Marley's "The
+/// Best Of" first).
+///
+/// Otherwise, a higher score fits better. Every *non-generic* word in the candidate's own title that the query
+/// never said is a strong signal this is the wrong release -- a different edition ("Wish You Were Here 50"'s
+/// "50"), a tribute/karaoke/cover ("Symphonic", "Karaoke", a cover artist's name in the subtitle already
+/// excluded such rows via the hard gate on artist, but a *title* word like "Cover" or "Tribute" still counts
+/// here) -- so each one is penalised heavily, well past any other factor. Generic editorial words ("Deluxe
+/// Edition", "Remastered") are exempt from that penalty, since the real "Breakfast In America (Deluxe Edition)"
+/// must not lose to a bare-titled amateur cover just because the listener never said "deluxe edition" -- but
+/// they still count toward the raw length bonus below, so the fuller official title edges out the bare one once
+/// neither is penalised.
+pub fn rank_candidate(query: &str, title: &str, subtitle: Option<&str>) -> Option<i32> {
+    if !candidate_matches(query, title, subtitle) {
+        return None;
     }
     let wanted = tokens(query);
-    title_tokens
+    let title_tokens = tokens(&clean_markup(title));
+    let unmatched_distinctive = title_tokens
         .iter()
-        .all(|t| wanted.iter().any(|w| token_matches(w, t)))
+        .filter(|t| !GENERIC.contains(&t.as_str()))
+        .filter(|t| !wanted.iter().any(|w| token_matches(w, t)))
+        .count() as i32;
+    Some(title_tokens.len() as i32 - unmatched_distinctive * 1000)
+}
+
+/// The best-ranked item in `items` by [`rank_candidate`], or `None` if nothing clears its hard gate. A tie keeps
+/// the earlier item (Roon's own ranking breaks ties), unlike `Iterator::max_by_key`, which keeps the last.
+pub fn best_candidate<'a, T>(
+    query: &str,
+    items: impl IntoIterator<Item = &'a T>,
+    title: impl Fn(&'a T) -> &'a str,
+    subtitle: impl Fn(&'a T) -> Option<&'a str>,
+) -> Option<&'a T> {
+    let mut best: Option<(&'a T, i32)> = None;
+    for item in items {
+        let Some(score) = rank_candidate(query, title(item), subtitle(item)) else {
+            continue;
+        };
+        if best.is_none_or(|(_, best_score)| score > best_score) {
+            best = Some((item, score));
+        }
+    }
+    best.map(|(item, _)| item)
 }
 
 /// `Title - Artist` for messages back to the caller (markup removed).
@@ -318,6 +358,79 @@ mod tests {
     fn a_query_of_only_generic_words_is_not_blocked() {
         assert!(candidate_matches("the best of", "Anything", None));
         assert!(candidate_matches("", "Anything", None));
+    }
+
+    #[test]
+    fn rank_candidate_rejects_a_missing_distinctive_word() {
+        assert_eq!(
+            rank_candidate(
+                "The Best of Goldfrapp",
+                "Legend \u{2013} The Best Of Bob Marley & The Wailers",
+                Some("[[41082|Bob Marley & The Wailers]]"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rank_candidate_prefers_the_fuller_official_title_when_neither_is_penalised() {
+        // The real "Breakfast In America" is catalogued with "(Deluxe Edition)" in its own title -- the
+        // listener never says that -- surrounded by bare-titled amateur covers of the same song. Neither is
+        // penalised (no non-generic extra words), so the fuller, official title must still score higher.
+        let deluxe = rank_candidate(
+            "breakfast in america",
+            "Breakfast In America (Deluxe Edition)",
+            Some("[[1|Supertramp]]"),
+        )
+        .expect("passes the hard gate");
+        let cover = rank_candidate(
+            "breakfast in america",
+            "Breakfast in America",
+            Some("[[9|Viktor Sj\u{f6}berg]]"),
+        )
+        .expect("passes the hard gate");
+        assert!(deluxe > cover, "deluxe={deluxe} cover={cover}");
+    }
+
+    #[test]
+    fn rank_candidate_penalises_a_non_generic_extra_word_past_any_length_bonus() {
+        // "50" is not an editorial word -- it is a different, specific edition the listener would have to ask
+        // for -- so even though it is the *only* candidate with the query's exact wording otherwise, a
+        // hypothetical bare-titled release must still outrank it.
+        let anniversary = rank_candidate(
+            "wish you were here",
+            "Wish You Were Here 50",
+            Some("[[1|Pink Floyd]]"),
+        )
+        .expect("passes the hard gate");
+        let bare = rank_candidate(
+            "wish you were here",
+            "Wish You Were Here",
+            Some("[[1|Pink Floyd]]"),
+        )
+        .expect("passes the hard gate");
+        assert!(bare > anniversary, "bare={bare} anniversary={anniversary}");
+    }
+
+    #[test]
+    fn best_candidate_picks_the_top_score_keeping_the_earlier_item_on_a_tie() {
+        struct Row(&'static str, &'static str);
+        let rows = [
+            Row("Breakfast in America", "Viktor Sj\u{f6}berg"),
+            Row("Breakfast In America (Deluxe Edition)", "Supertramp"),
+            Row("Breakfast in America", "Everlone"),
+        ];
+        let picked = best_candidate("breakfast in america", &rows, |r| r.0, |r| Some(r.1))
+            .expect("something should match");
+        assert_eq!(picked.1, "Supertramp");
+
+        let tied = [
+            Row("Breakfast in America", "A"),
+            Row("Breakfast in America", "B"),
+        ];
+        let picked = best_candidate("breakfast in america", &tied, |r| r.0, |r| Some(r.1))
+            .expect("something should match");
+        assert_eq!(picked.1, "A", "a tie keeps the earlier item");
     }
 
     #[test]

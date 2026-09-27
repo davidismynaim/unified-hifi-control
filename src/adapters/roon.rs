@@ -2903,26 +2903,23 @@ impl RoonAdapter {
         } else {
             "Albums"
         };
-        // Strict first (the title is wholly inside the query) so a real album is preferred over a same-named
-        // track; then loose (candidate_matches alone), which also catches a reissue whose canonical title has
-        // grown a suffix Roon's catalogue now uses instead ("Wish You Were Here" is catalogued as "Wish You Were
-        // Here 50") -- without this, Auto fell through past the Albums list entirely to Roon's raw top hit, which
-        // is not necessarily the album at all (here, a single/compilation credit with only one track).
-        for strict in [true, false] {
-            if let Some(result) = self
-                .try_exact_in_category(
-                    category,
-                    strict,
-                    query,
-                    &session_key,
-                    bare_zone_id,
-                    &search_results.items,
-                    action,
-                )
-                .await?
-            {
-                return Ok(result);
-            }
+        // The single best-ranked candidate in that category (see `roon_match::rank_candidate`), which also
+        // catches a reissue whose canonical title has grown a suffix Roon's catalogue now uses instead ("Wish
+        // You Were Here" is catalogued as "Wish You Were Here 50") -- without this, Auto fell through past the
+        // Albums list entirely to Roon's raw top hit, which is not necessarily the album at all (here, a
+        // single/compilation credit with only one track).
+        if let Some(result) = self
+            .try_exact_in_category(
+                category,
+                query,
+                &session_key,
+                bare_zone_id,
+                &search_results.items,
+                action,
+            )
+            .await?
+        {
+            return Ok(result);
         }
         // An explicit album/song was asked for and neither pass above found one: refuse rather than fall through
         // to Roon's raw top hit, which is exactly the kind of row (right words, wrong item) this guards against.
@@ -2989,7 +2986,6 @@ impl RoonAdapter {
     async fn try_exact_in_category(
         &self,
         category: &str,
-        strict: bool,
         query: &str,
         session_key: &str,
         zone_id: &str,
@@ -3018,21 +3014,14 @@ impl RoonAdapter {
                 ..Default::default()
             })
             .await?;
-        // Longest fitting title wins (the full album name over a shorter accidental fit); Roon's order breaks ties.
-        let mut best: Option<(&BrowseItem, usize)> = None;
-        for item in &albums.items {
-            if item.item_key.is_none()
-                || !roon_match::candidate_matches(query, &item.title, item.subtitle.as_deref())
-                || (strict && !roon_match::title_fits_query(query, &item.title))
-            {
-                continue;
-            }
-            let weight = roon_match::tokens(&roon_match::clean_markup(&item.title)).len();
-            if best.is_none_or(|(_, w)| weight > w) {
-                best = Some((item, weight));
-            }
-        }
-        let Some((album, _)) = best else {
+        // One ranking pass over every candidate -- see `roon_match::rank_candidate` for why this replaced a
+        // staged strict-then-loose gate (three separate live bugs turned out to be that one design flaw).
+        let Some(album) = roon_match::best_candidate(
+            query,
+            albums.items.iter().filter(|item| item.item_key.is_some()),
+            |item| item.title.as_str(),
+            |item| item.subtitle.as_deref(),
+        ) else {
             return Ok(None);
         };
         let album_title = roon_match::display_title(&album.title, album.subtitle.as_deref());
