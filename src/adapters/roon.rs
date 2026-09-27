@@ -2789,11 +2789,14 @@ impl RoonAdapter {
         source: SearchSource,
         action: PlayAction,
     ) -> Result<String> {
-        self.search_and_play_kind(query, zone_id, source, action, PlayKind::Auto)
+        self.search_and_play_kind(query, zone_id, source, action, PlayKind::Auto, None)
             .await
     }
 
-    /// [`Self::search_and_play`] with the caller's say on albums versus tracks.
+    /// [`Self::search_and_play`] with the caller's say on albums versus tracks, and the artist separately from
+    /// the title when the caller knows it (see [`roon_match::best_candidate_for_artist`] for why that is worth
+    /// having: an artist-identity check picks the right one among an Albums category's noise more reliably than
+    /// scoring the title's words ever did).
     pub async fn search_and_play_kind(
         &self,
         query: &str,
@@ -2801,6 +2804,7 @@ impl RoonAdapter {
         source: SearchSource,
         action: PlayAction,
         kind: PlayKind,
+        artist: Option<&str>,
     ) -> Result<String> {
         let session_key = format!(
             "play_{}",
@@ -2903,7 +2907,8 @@ impl RoonAdapter {
         } else {
             "Albums"
         };
-        // The single best-ranked candidate in that category (see `roon_match::rank_candidate`), which also
+        // The best candidate in that category -- by artist identity when `artist` is known (preferred: see
+        // `try_exact_in_category`'s own doc comment), otherwise by word-count ranking. Either way this also
         // catches a reissue whose canonical title has grown a suffix Roon's catalogue now uses instead ("Wish
         // You Were Here" is catalogued as "Wish You Were Here 50") -- without this, Auto fell through past the
         // Albums list entirely to Roon's raw top hit, which is not necessarily the album at all (here, a
@@ -2912,6 +2917,7 @@ impl RoonAdapter {
             .try_exact_in_category(
                 category,
                 query,
+                artist,
                 &session_key,
                 bare_zone_id,
                 &search_results.items,
@@ -2987,6 +2993,7 @@ impl RoonAdapter {
         &self,
         category: &str,
         query: &str,
+        artist: Option<&str>,
         session_key: &str,
         zone_id: &str,
         items: &[BrowseItem],
@@ -3014,14 +3021,30 @@ impl RoonAdapter {
                 ..Default::default()
             })
             .await?;
-        // One ranking pass over every candidate -- see `roon_match::rank_candidate` for why this replaced a
-        // staged strict-then-loose gate (three separate live bugs turned out to be that one design flaw).
-        let Some(album) = roon_match::best_candidate(
-            query,
-            albums.items.iter().filter(|item| item.item_key.is_some()),
-            |item| item.title.as_str(),
-            |item| item.subtitle.as_deref(),
-        ) else {
+        // When the artist is known separately, trust Roon's own ordering and just require it actually be that
+        // artist (`roon_match::subtitle_names_artist` -- an identity check, not word overlap, so a tribute or
+        // "performs" credit is excluded rather than merely discounted). Only fall back to word-count ranking
+        // (`roon_match::rank_candidate`) when there is no artist to check against: that scoring turned out to be
+        // fooled by a "lyrics video" entry whose title just restates the query -- three separate live bugs
+        // (Wish You Were Here, Arrival, Breakfast In America) already showed staged word-matching keeps needing
+        // a new patch for each new shape of Roon catalogue noise; an artist identity check does not.
+        let candidates = albums.items.iter().filter(|item| item.item_key.is_some());
+        let album = match artist {
+            Some(artist) => roon_match::best_candidate_for_artist(
+                query,
+                artist,
+                candidates,
+                |item| item.title.as_str(),
+                |item| item.subtitle.as_deref(),
+            ),
+            None => roon_match::best_candidate(
+                query,
+                candidates,
+                |item| item.title.as_str(),
+                |item| item.subtitle.as_deref(),
+            ),
+        };
+        let Some(album) = album else {
             return Ok(None);
         };
         let album_title = roon_match::display_title(&album.title, album.subtitle.as_deref());

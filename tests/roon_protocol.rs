@@ -1394,6 +1394,48 @@ async fn an_album_whose_title_is_in_the_query_beats_a_same_named_track() {
 }
 
 #[tokio::test]
+async fn the_artist_field_skips_a_query_mirroring_decoy_that_scoring_alone_fell_for() {
+    // Live regression: word-count ranking picked "wish you were here by pink floyd" credited to "genius genius"
+    // (a lyrics-video entry whose title just restates the query) over the real album, because it had zero
+    // unmatched words and more of them. An artist-identity check must skip it outright, even though Roon lists
+    // it before the real album.
+    let mut library = FakeLibrary::standard();
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![FakeItem::list("Albums").with_children(vec![
+            FakeItem::list("wish you were here by pink floyd")
+                .with_subtitle("[[1|genius genius]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+            FakeItem::list("Wish You Were Here 50")
+                .with_subtitle("[[2|Pink Floyd]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+        ])],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play_kind(
+            "wish you were here pink floyd",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+            unified_hifi_control::adapters::roon::PlayKind::Auto,
+            Some("Pink Floyd"),
+        )
+        .await
+        .expect("the real album is in the results");
+    assert_eq!(
+        message, "Play Now: Wish You Were Here 50 - Pink Floyd",
+        "got {message}"
+    );
+
+    core.stop().await;
+}
+
+#[tokio::test]
 async fn kind_album_plays_the_album_and_never_a_track() {
     let core = FakeRoonCore::start_with(wish_you_were_here_library()).await;
     let adapter = connected(&core).await;
@@ -1404,6 +1446,7 @@ async fn kind_album_plays_the_album_and_never_a_track() {
             SearchSource::Library,
             PlayAction::Play,
             unified_hifi_control::adapters::roon::PlayKind::Album,
+            None,
         )
         .await
         .expect("the album is in the Albums list");
@@ -1431,6 +1474,7 @@ async fn kind_album_plays_the_album_and_never_a_track() {
             SearchSource::Library,
             PlayAction::Play,
             unified_hifi_control::adapters::roon::PlayKind::Album,
+            None,
         )
         .await
         .expect_err("an explicit album request must not play a track");
@@ -1530,6 +1574,7 @@ async fn the_real_album_is_found_behind_a_work_style_top_hit() {
             SearchSource::Library,
             PlayAction::Queue,
             unified_hifi_control::adapters::roon::PlayKind::Album,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("the album is right there in Albums: {e}"));
@@ -1595,6 +1640,7 @@ async fn kind_track_plays_the_song_from_the_tracks_list_not_an_album() {
             SearchSource::Library,
             PlayAction::Play,
             unified_hifi_control::adapters::roon::PlayKind::Track,
+            None,
         )
         .await
         .expect("the song is in the Tracks list");

@@ -222,6 +222,12 @@ pub fn rank_candidate(query: &str, title: &str, subtitle: Option<&str>) -> Optio
 
 /// The best-ranked item in `items` by [`rank_candidate`], or `None` if nothing clears its hard gate. A tie keeps
 /// the earlier item (Roon's own ranking breaks ties), unlike `Iterator::max_by_key`, which keeps the last.
+///
+/// This is the fallback for when the caller does not know the artist separately from the title. When it does,
+/// prefer [`best_candidate_for_artist`] instead: word-count scoring is fundamentally shaky (see its own doc
+/// comment on `rank_candidate`'s history) in a way an artist-identity check just isn't, and Roon's own ordering
+/// already does the "which one is more official-sounding" job when the field of candidates is scoped to the
+/// right artist to begin with.
 pub fn best_candidate<'a, T>(
     query: &str,
     items: impl IntoIterator<Item = &'a T>,
@@ -238,6 +244,42 @@ pub fn best_candidate<'a, T>(
         }
     }
     best.map(|(item, _)| item)
+}
+
+/// True when one of `subtitle`'s individually-credited names (Roon separates several with "," or "/") *is*
+/// `artist` -- the same set of words, not merely overlapping with it. "Atom Pink Floyd Tribute" and "The Machine
+/// Performs Pink Floyd" both contain the words "Pink Floyd" and would pass a word-overlap check, but neither
+/// *is* Pink Floyd; a plain "[[3962|Pink Floyd]]" credit is.
+pub fn subtitle_names_artist(artist: &str, subtitle: &str) -> bool {
+    let wanted: std::collections::BTreeSet<String> = tokens(artist).into_iter().collect();
+    if wanted.is_empty() {
+        return false;
+    }
+    clean_markup(subtitle)
+        .split(&[',', '/'][..])
+        .any(|segment| {
+            let have: Vec<String> = tokens(segment);
+            have.len() == wanted.len()
+                && have
+                    .iter()
+                    .all(|h| wanted.iter().any(|w| token_matches(w, h)))
+        })
+}
+
+/// The first candidate in `items` (Roon's own order -- see [`best_candidate`]'s doc comment for why this is
+/// preferred over scoring once the artist is known separately) whose title still plausibly matches `query` and
+/// whose subtitle actually names `artist` per [`subtitle_names_artist`].
+pub fn best_candidate_for_artist<'a, T>(
+    query: &str,
+    artist: &str,
+    items: impl IntoIterator<Item = &'a T>,
+    title: impl Fn(&'a T) -> &'a str,
+    subtitle: impl Fn(&'a T) -> Option<&'a str>,
+) -> Option<&'a T> {
+    items.into_iter().find(|item| {
+        candidate_matches(query, title(item), subtitle(item))
+            && subtitle_names_artist(artist, subtitle(item).unwrap_or(""))
+    })
 }
 
 /// `Title - Artist` for messages back to the caller (markup removed).
@@ -431,6 +473,54 @@ mod tests {
         let picked = best_candidate("breakfast in america", &tied, |r| r.0, |r| Some(r.1))
             .expect("something should match");
         assert_eq!(picked.1, "A", "a tie keeps the earlier item");
+    }
+
+    #[test]
+    fn subtitle_names_artist_rejects_a_tribute_or_performer_credit() {
+        assert!(subtitle_names_artist("Pink Floyd", "[[3962|Pink Floyd]]"));
+        assert!(subtitle_names_artist("pink floyd", "Pink Floyd"));
+        assert!(!subtitle_names_artist(
+            "Pink Floyd",
+            "[[1|Atom Pink Floyd Tribute]]"
+        ));
+        assert!(!subtitle_names_artist(
+            "Pink Floyd",
+            "[[1|The Machine Performs Pink Floyd]]"
+        ));
+        assert!(!subtitle_names_artist("Pink Floyd", "Various Artists"));
+        // Multiple credits, comma-separated: matches if any one of them is exactly the artist.
+        assert!(subtitle_names_artist(
+            "Pink Floyd",
+            "Roger Waters, David Gilmour, Pink Floyd"
+        ));
+        // A slash-separated multi-credit line too.
+        assert!(subtitle_names_artist(
+            "Felix Samuel",
+            "Madism / Felix Samuel"
+        ));
+    }
+
+    #[test]
+    fn best_candidate_for_artist_takes_roons_own_first_match_ignoring_a_query_mirroring_decoy() {
+        struct Row(&'static str, &'static str);
+        let rows = [
+            Row("wish you were here by pink floyd", "genius genius"), // a lyrics-video decoy: matches every
+            // word of the query and then some, but is not by Pink Floyd.
+            Row("Wish You Were Here 50", "Pink Floyd"),
+            Row(
+                "Pink Floyd's Wish You Were Here Symphonic",
+                "London Orion Orchestra",
+            ),
+        ];
+        let picked = best_candidate_for_artist(
+            "wish you were here pink floyd",
+            "Pink Floyd",
+            &rows,
+            |r| r.0,
+            |r| Some(r.1),
+        )
+        .expect("the real album is in the rows");
+        assert_eq!(picked.0, "Wish You Were Here 50");
     }
 
     #[test]

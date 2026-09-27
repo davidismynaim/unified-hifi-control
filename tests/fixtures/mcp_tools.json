@@ -408,11 +408,16 @@
     }
   },
   "hifi_play": {
-    "description": "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. Apple Music play/queue uses a paired iPhone companion and owner-scoped opaque refs; physical validation remains tracked in #465. Music Assistant supports play and queue against its active player queue. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead. Use hifi_play only when the query is an exact artist, album or track title (with the artist for tracks); never pass the words of a request such as 'best of X' or 'greatest hits', because the search matches those words against unrelated titles. On Roon, a result that does not contain every distinctive word of the query is refused and the reply says nothing was played; otherwise the reply names what was played as 'Title - Artist'. Report only what the reply says was played.",
+    "description": "Search and play music. Searches and plays or queues the first matching result. Use action='queue' to add to queue. action='radio' and source param are Roon-only; Spotify supports play and queue for Spotify Connect zones. Apple Music play/queue uses a paired iPhone companion and owner-scoped opaque refs; physical validation remains tracked in #465. Music Assistant supports play and queue against its active player queue. To act on a specific hifi_search result rather than the first match for a title, use hifi_play_ref with that result's `ref` instead. Use hifi_play only when the query is an exact artist, album or track title (with the artist for tracks); never pass the words of a request such as 'best of X' or 'greatest hits', because the search matches those words against unrelated titles. On Roon, always set the artist field when it is known: it is matched by identity (not by word overlap), so a cover, tribute or 'performs' credit is correctly excluded, and the right one is chosen by Roon's own ranking rather than by guessing which words in a title matter. On Roon, a result that does not contain every distinctive word of the query is refused and the reply says nothing was played; otherwise the reply names what was played as 'Title - Artist'. Report only what the reply says was played.",
     "inputSchema": {
       "properties": {
         "action": {
           "description": "What to do: \"play\" (default), \"queue\", or \"radio\". radio is Roon-only.",
+          "nullable": true,
+          "type": "string"
+        },
+        "artist": {
+          "description": "Roon only. The artist's name, when known, separately from `query`. Strongly recommended whenever the\nartist is known: it is checked by identity against each candidate, not by word overlap, so a tribute,\ncover or \"performs\" credit is correctly excluded rather than merely discounted, and Roon's own ranking\nthen picks the right one among same-artist candidates instead of a guess about which title words matter.",
           "nullable": true,
           "type": "string"
         },
