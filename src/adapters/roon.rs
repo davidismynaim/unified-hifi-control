@@ -179,21 +179,26 @@ fn find_action_item(items: &[BrowseItem], action: PlayAction) -> Option<&BrowseI
     if matches!(action, PlayAction::Play) {
         return candidates.first().copied();
     }
-    // A lone ActionList is an unopened submenu, not a refusal: its real verbs are
-    // invisible until it is entered. Live Roon's search-hit and album wrapper often
-    // repeats the parent's own title rather than naming an action (unlike the
-    // mock's "Play Album"), so it never matches by name and used to be refused
-    // outright for queue/radio even though the actual menu one level down offered
-    // it (#: "Wish You Were Here" queue/radio wrongly reported unavailable). A lone
-    // Action, by contrast, is the final leaf: if it does not name the requested
-    // verb, the verb genuinely is not offered, and execute_play_action's caller
-    // must still see that refusal -- so this never applies to it.
+    // An unopened submenu (hint ActionList) hides its real verbs until entered, unlike a leaf Action, which
+    // already names one -- if it does not name the one asked for, that verb genuinely is not offered, and this
+    // must not paper over that refusal. Two live shapes need entering: a lone search-hit/album wrapper that
+    // repeats its parent's own title instead of naming an action (nothing to match on but it is the only
+    // candidate: e.g. plain "Wish You Were Here"); and a multi-disc/deluxe album whose browse view lists "Play
+    // Album" as one ActionList row alongside every individual track (each itself an ActionList, so "the only
+    // candidate" does not hold -- the one actually titled like a play menu must be picked instead, or a track's
+    // own menu gets entered and only that track queues: e.g. "Breakfast In America").
     if let [only] = candidates.as_slice() {
         if matches!(only.hint, Some(ItemHint::ActionList)) {
             return Some(only);
         }
     }
-    None
+    candidates
+        .iter()
+        .find(|item| {
+            matches!(item.hint, Some(ItemHint::ActionList))
+                && item.title.to_lowercase().starts_with("play")
+        })
+        .copied()
 }
 
 /// Find the first playable item in a list (hint is Action or ActionList)
@@ -2898,26 +2903,29 @@ impl RoonAdapter {
         } else {
             "Albums"
         };
+        // Strict first (the title is wholly inside the query) so a real album is preferred over a same-named
+        // track; then loose (candidate_matches alone), which also catches a reissue whose canonical title has
+        // grown a suffix Roon's catalogue now uses instead ("Wish You Were Here" is catalogued as "Wish You Were
+        // Here 50") -- without this, Auto fell through past the Albums list entirely to Roon's raw top hit, which
+        // is not necessarily the album at all (here, a single/compilation credit with only one track).
         for strict in [true, false] {
-            // Auto assumes an album but may fall back to the best hit; an explicit album/song never plays the
-            // other kind, so it only widens the match (title need not be wholly inside the query) and then refuses.
-            if strict || kind != PlayKind::Auto {
-                if let Some(result) = self
-                    .try_exact_in_category(
-                        category,
-                        strict,
-                        query,
-                        &session_key,
-                        bare_zone_id,
-                        &search_results.items,
-                        action,
-                    )
-                    .await?
-                {
-                    return Ok(result);
-                }
+            if let Some(result) = self
+                .try_exact_in_category(
+                    category,
+                    strict,
+                    query,
+                    &session_key,
+                    bare_zone_id,
+                    &search_results.items,
+                    action,
+                )
+                .await?
+            {
+                return Ok(result);
             }
         }
+        // An explicit album/song was asked for and neither pass above found one: refuse rather than fall through
+        // to Roon's raw top hit, which is exactly the kind of row (right words, wrong item) this guards against.
         if kind != PlayKind::Auto {
             return Err(no_confident_match(query, &search_results.items));
         }
@@ -2988,11 +2996,16 @@ impl RoonAdapter {
         items: &[BrowseItem],
         action: PlayAction,
     ) -> Result<Option<String>> {
+        tracing::warn!(
+            "DEBUG try_exact_in_category({category}, strict={strict}, query={query:?}): top-level items = {:?}",
+            items.iter().map(|i| (&i.title, &i.subtitle)).collect::<Vec<_>>()
+        );
         let Some(cat_key) = items
             .iter()
             .find(|item| item.title == category)
             .and_then(|item| item.item_key.clone())
         else {
+            tracing::warn!("DEBUG: no '{category}' item found in top-level items");
             return Ok(None);
         };
 
@@ -3010,6 +3023,14 @@ impl RoonAdapter {
                 ..Default::default()
             })
             .await?;
+        tracing::warn!(
+            "DEBUG {category} contents = {:?}",
+            albums
+                .items
+                .iter()
+                .map(|i| (&i.hint, &i.title, &i.subtitle, &i.item_key))
+                .collect::<Vec<_>>()
+        );
 
         // Longest fitting title wins (the full album name over a shorter accidental fit); Roon's order breaks ties.
         let mut best: Option<(&BrowseItem, usize)> = None;
@@ -3026,6 +3047,7 @@ impl RoonAdapter {
             }
         }
         let Some((album, _)) = best else {
+            tracing::warn!("DEBUG: no candidate in {category} matched (strict={strict})");
             return Ok(None);
         };
         let album_title = roon_match::display_title(&album.title, album.subtitle.as_deref());

@@ -1438,6 +1438,52 @@ async fn kind_album_plays_the_album_and_never_a_track() {
     core.stop().await;
 }
 
+/// Live reproduction of the Arrival/ABBA failure: the top-level search hit is a Work-style row (subtitle is
+/// plain composer credits, no [[id|Name]] link -- a different shape from a real recording's artist line) that
+/// is itself directly playable, sitting next to an "Albums" category that DOES contain the real, unambiguous
+/// album. If the top-level hit is checked before Albums, or Albums is skipped somehow, that Work plays/queues
+/// instead of the album, and reports success under the album's own display name because both share the title.
+fn arrival_library() -> FakeLibrary {
+    let mut library = FakeLibrary::standard();
+    let work_hit = FakeItem::action_list("Arrival")
+        .with_subtitle("Benny Andersson, Bj\u{f6}rn Ulvaeus, ABBA")
+        .with_children(vec![FakeItem::action("Play Now")]);
+    let album_wrapper = FakeItem::action_list("Play Album").with_children(vec![
+        FakeItem::action("Play Now"),
+        FakeItem::action("Add Next"),
+        FakeItem::action("Queue"),
+        FakeItem::action("Start Radio"),
+    ]);
+    let album = FakeItem::list("Arrival")
+        .with_subtitle("[[706682|ABBA]]")
+        .with_children(vec![album_wrapper]);
+    let albums_category = FakeItem::list("Albums").with_children(vec![album]);
+    library
+        .search_results
+        .insert("Library".to_string(), vec![work_hit, albums_category]);
+    library
+}
+
+#[tokio::test]
+async fn the_real_album_is_found_behind_a_work_style_top_hit() {
+    let core = FakeRoonCore::start_with(arrival_library()).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play_kind(
+            "arrival abba",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Queue,
+            unified_hifi_control::adapters::roon::PlayKind::Album,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the album is right there in Albums: {e}"));
+    assert_eq!(message, "Queue: Arrival - ABBA", "got {message}");
+
+    core.stop().await;
+}
+
 /// Live Roon's own wrapper for a search-hit item repeats the item's own title rather than naming an action
 /// (unlike the mock library's "Play Album"), so it cannot be matched by name; the fix must still be entered to
 /// reach Play Now/Add Next/Queue/Start Radio, for actions other than the default Play too.
