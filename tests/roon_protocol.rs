@@ -1438,6 +1438,51 @@ async fn kind_album_plays_the_album_and_never_a_track() {
     core.stop().await;
 }
 
+/// Live Roon's own wrapper for a search-hit item repeats the item's own title rather than naming an action
+/// (unlike the mock library's "Play Album"), so it cannot be matched by name; the fix must still be entered to
+/// reach Play Now/Add Next/Queue/Start Radio, for actions other than the default Play too.
+fn same_titled_wrapper_library() -> FakeLibrary {
+    let mut library = FakeLibrary::standard();
+    let wrapper = FakeItem::action_list("Wish You Were Here")
+        .with_subtitle("[[1|Pink Floyd]]")
+        .with_children(vec![
+            FakeItem::action("Play Now"),
+            FakeItem::action("Add Next"),
+            FakeItem::action("Queue"),
+            FakeItem::action("Start Radio"),
+        ]);
+    let album = FakeItem::list("Wish You Were Here")
+        .with_subtitle("[[1|Pink Floyd]]")
+        .with_children(vec![wrapper]);
+    let albums_category = FakeItem::list("Albums").with_children(vec![album]);
+    library
+        .search_results
+        .insert("Library".to_string(), vec![albums_category]);
+    library
+}
+
+#[tokio::test]
+async fn queue_and_radio_still_work_through_a_same_titled_wrapper() {
+    for action in [PlayAction::Queue, PlayAction::Radio] {
+        let core = FakeRoonCore::start_with(same_titled_wrapper_library()).await;
+        let adapter = connected(&core).await;
+        let message = adapter
+            .search_and_play(
+                "Wish You Were Here",
+                "roon:zone_fake_1",
+                SearchSource::Library,
+                action,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{action:?} should reach the real menu: {e}"));
+        assert!(
+            message.contains("Wish You Were Here"),
+            "{action:?}: got {message}"
+        );
+        core.stop().await;
+    }
+}
+
 #[tokio::test]
 async fn kind_track_plays_the_song_from_the_tracks_list_not_an_album() {
     let core = FakeRoonCore::start_with(wish_you_were_here_library()).await;

@@ -179,6 +179,20 @@ fn find_action_item(items: &[BrowseItem], action: PlayAction) -> Option<&BrowseI
     if matches!(action, PlayAction::Play) {
         return candidates.first().copied();
     }
+    // A lone ActionList is an unopened submenu, not a refusal: its real verbs are
+    // invisible until it is entered. Live Roon's search-hit and album wrapper often
+    // repeats the parent's own title rather than naming an action (unlike the
+    // mock's "Play Album"), so it never matches by name and used to be refused
+    // outright for queue/radio even though the actual menu one level down offered
+    // it (#: "Wish You Were Here" queue/radio wrongly reported unavailable). A lone
+    // Action, by contrast, is the final leaf: if it does not name the requested
+    // verb, the verb genuinely is not offered, and execute_play_action's caller
+    // must still see that refusal -- so this never applies to it.
+    if let [only] = candidates.as_slice() {
+        if matches!(only.hint, Some(ItemHint::ActionList)) {
+            return Some(only);
+        }
+    }
     None
 }
 
