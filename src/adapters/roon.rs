@@ -2996,16 +2996,11 @@ impl RoonAdapter {
         items: &[BrowseItem],
         action: PlayAction,
     ) -> Result<Option<String>> {
-        tracing::warn!(
-            "DEBUG try_exact_in_category({category}, strict={strict}, query={query:?}): top-level items = {:?}",
-            items.iter().map(|i| (&i.title, &i.subtitle)).collect::<Vec<_>>()
-        );
         let Some(cat_key) = items
             .iter()
             .find(|item| item.title == category)
             .and_then(|item| item.item_key.clone())
         else {
-            tracing::warn!("DEBUG: no '{category}' item found in top-level items");
             return Ok(None);
         };
 
@@ -3023,15 +3018,6 @@ impl RoonAdapter {
                 ..Default::default()
             })
             .await?;
-        tracing::warn!(
-            "DEBUG {category} contents = {:?}",
-            albums
-                .items
-                .iter()
-                .map(|i| (&i.hint, &i.title, &i.subtitle, &i.item_key))
-                .collect::<Vec<_>>()
-        );
-
         // Longest fitting title wins (the full album name over a shorter accidental fit); Roon's order breaks ties.
         let mut best: Option<(&BrowseItem, usize)> = None;
         for item in &albums.items {
@@ -3047,7 +3033,6 @@ impl RoonAdapter {
             }
         }
         let Some((album, _)) = best else {
-            tracing::warn!("DEBUG: no candidate in {category} matched (strict={strict})");
             return Ok(None);
         };
         let album_title = roon_match::display_title(&album.title, album.subtitle.as_deref());
@@ -3080,26 +3065,46 @@ impl RoonAdapter {
                 ..Default::default()
             })
             .await?;
-        tracing::warn!(
-            "DEBUG entered {category} item {:?} (key={album_key}) -> inner items = {:?}",
-            album.title,
-            inner
-                .items
-                .iter()
-                .map(|i| (&i.hint, &i.title, &i.item_key))
-                .collect::<Vec<_>>()
-        );
-        let Some(playable) = find_playable_item(&inner.items) else {
-            tracing::warn!(
-                "DEBUG: no playable item inside {category} item {:?}",
-                album.title
-            );
-            return Ok(None);
+        // Some releases interpose an editions picker: one more single `List` row, same title, before the real
+        // action menu (observed live: ABBA's "Arrival" -- Albums row -> one more "Arrival" row -> *then* "Play
+        // Album" alongside the tracks). `try_navigate_to_playable` already does this same one-more-level dance
+        // for its own top-hit path; this bounds it a little further (3 hops) since an edition row could in
+        // principle repeat.
+        let mut current = inner.items;
+        let mut hops = 0;
+        let key = loop {
+            if let Some(playable) = find_playable_item(&current) {
+                break playable
+                    .item_key
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
+            }
+            hops += 1;
+            let Some(only) = current.first().filter(|_| current.len() == 1) else {
+                return Ok(None);
+            };
+            if !matches!(only.hint, Some(ItemHint::List)) || hops > 3 {
+                return Ok(None);
+            }
+            let Some(next_key) = only.item_key.clone() else {
+                return Ok(None);
+            };
+            self.browse(BrowseOpts {
+                multi_session_key: Some(session_key.to_string()),
+                item_key: Some(next_key),
+                zone_or_output_id: Some(zone_id.to_string()),
+                ..Default::default()
+            })
+            .await?;
+            current = self
+                .load(LoadOpts {
+                    multi_session_key: Some(session_key.to_string()),
+                    count: Some(20),
+                    ..Default::default()
+                })
+                .await?
+                .items;
         };
-        let key = playable
-            .item_key
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Item has no key"))?;
         Ok(Some(
             self.execute_play_action(session_key, zone_id, &album_title, &key, action)
                 .await?,

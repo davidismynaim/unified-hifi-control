@@ -1438,25 +1438,29 @@ async fn kind_album_plays_the_album_and_never_a_track() {
     core.stop().await;
 }
 
-/// Live reproduction of the Arrival/ABBA failure: the top-level search hit is a Work-style row (subtitle is
-/// plain composer credits, no [[id|Name]] link -- a different shape from a real recording's artist line) that
-/// is itself directly playable, sitting next to an "Albums" category that DOES contain the real, unambiguous
-/// album. If the top-level hit is checked before Albums, or Albums is skipped somehow, that Work plays/queues
-/// instead of the album, and reports success under the album's own display name because both share the title.
+/// Live reproduction of the Arrival/ABBA failure: the "Albums" category's one, unambiguous result is not
+/// the album itself but an editions picker -- one more single-item "List" row repeating the same title -- before
+/// the real action menu ("Play Album" alongside every track). Without descending through it, nothing there
+/// looks playable at all, and the code fell all the way through to a Work-style top-level hit instead.
 fn arrival_library() -> FakeLibrary {
     let mut library = FakeLibrary::standard();
     let work_hit = FakeItem::action_list("Arrival")
         .with_subtitle("Benny Andersson, Bj\u{f6}rn Ulvaeus, ABBA")
         .with_children(vec![FakeItem::action("Play Now")]);
-    let album_wrapper = FakeItem::action_list("Play Album").with_children(vec![
+    let album_menu = FakeItem::action_list("Play Album").with_children(vec![
         FakeItem::action("Play Now"),
         FakeItem::action("Add Next"),
         FakeItem::action("Queue"),
         FakeItem::action("Start Radio"),
     ]);
+    let mut track_children = vec![album_menu];
+    for n in 1..=12 {
+        track_children.push(FakeItem::action_list(&format!("{n}. Track {n}")));
+    }
+    let edition = FakeItem::list("Arrival").with_children(track_children);
     let album = FakeItem::list("Arrival")
         .with_subtitle("[[706682|ABBA]]")
-        .with_children(vec![album_wrapper]);
+        .with_children(vec![edition]);
     let albums_category = FakeItem::list("Albums").with_children(vec![album]);
     library
         .search_results
