@@ -82,6 +82,7 @@ GET /roon/image
 GET /roon/search
 GET /roon/status
 GET /roon/zone/{zone_id}
+GET /roon/zone/{zone_id}/queue_next
 GET /roon/zones
 GET /status
 GET /tailwind.css

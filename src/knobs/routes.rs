@@ -230,6 +230,28 @@ pub struct NowPlayingResponse {
     pub zones: Vec<ZoneInfo>,
     pub config_sha: Option<String>,
     pub zones_sha: Option<String>,
+    /// From `roon-swim-bridge` (a separate process - see its README): the
+    /// track Roon Radio has already picked, read with real lead time before
+    /// the public API would show it. Omitted entirely (not `null`) when
+    /// unknown, matching `bridge_client.c`'s flat-JSON substring parser,
+    /// which treats an absent key as "not available" the same way it
+    /// already does for `image_key`/`config_sha`/`zones_sha`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_track_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_track_artist: Option<String>,
+    /// Decoded from Roon's private `Sooloos.NullDate` wire format - see
+    /// `roon_swim::RoonSwimPayload` for how.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub album_year: Option<i32>,
+    /// Pre-formatted ("24-bit / 192kHz"), matching how `line1`/`line2`/`line3`
+    /// already ship server-formatted text for the knob to display verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bit_info: Option<String>,
+    /// Emitted only (as literal `true`) when the sidecar positively knows
+    /// nothing is coming next; the knob shows "Nothing". Absent means unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_track_none: Option<bool>,
 }
 
 /// Helper to build zone info list for error responses
@@ -328,19 +350,27 @@ pub async fn knob_now_playing_handler(
 
     // Get zone from aggregator (single source of truth)
     let zone = match state.aggregator.get_zone(&prefixed_zone_id).await {
-        Some(z) => z,
-        None => {
-            let zones_sha = compute_zones_sha(&zone_infos);
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "zone not found",
-                    "error_code": "ZONE_NOT_FOUND",
-                    "zones": zone_infos,
-                    "zones_sha": zones_sha
-                })),
-            ));
+        Some(z) => {
+            crate::knobs::zone_grace::remember(&z);
+            z
         }
+        // Roon removes and re-adds zones on its own, sometimes for tens of seconds; a poll
+        // landing in that gap must not become the knob's "Retry" screen. See `zone_grace`.
+        None => match crate::knobs::zone_grace::recall_recent(&prefixed_zone_id) {
+            Some(z) => z,
+            None => {
+                let zones_sha = compute_zones_sha(&zone_infos);
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "zone not found",
+                        "error_code": "ZONE_NOT_FOUND",
+                        "zones": zone_infos,
+                        "zones_sha": zones_sha
+                    })),
+                ));
+            }
+        },
     };
 
     // Check if zone's adapter is enabled
@@ -403,6 +433,22 @@ pub async fn knob_now_playing_handler(
         None => "fixed".to_string(),
     };
 
+    // Sidecar data is only used while it is online and fresh, and only for the
+    // track it was computed for - see `RoonSwimPayload::extras_for`.
+    let extras = match np.map(|n| n.title.as_str()).filter(|t| !t.is_empty()) {
+        Some(title) => state
+            .mqtt
+            .roon_swim_store()
+            .get_fresh(
+                &crate::mqtt::topics::zone_slug(&zone.zone_id),
+                crate::mqtt::roon_swim::MAX_PAYLOAD_AGE,
+            )
+            .await
+            .map(|p| p.extras_for(title))
+            .unwrap_or_default(),
+        None => Default::default(),
+    };
+
     Ok(Json(NowPlayingResponse {
         zone_id: zone.zone_id,
         line1,
@@ -428,6 +474,11 @@ pub async fn knob_now_playing_handler(
         zones: zone_infos.clone(),
         config_sha,
         zones_sha: Some(compute_zones_sha(&zone_infos)),
+        next_track_title: extras.next_track_title,
+        next_track_artist: extras.next_track_artist,
+        album_year: extras.album_year,
+        bit_info: extras.bit_info,
+        next_track_none: extras.next_track_none.then_some(true),
     }))
 }
 
@@ -1171,6 +1222,24 @@ async fn control_roon(
                 output_id: None,
             })
         }
+        // Dial's detail-screen seek-jog (encoder scrubs position, committed
+        // after a short idle debounce) - same validation the HQPlayer path
+        // above already applies to this action name, just without the
+        // duration ceiling: this handler has no pre-fetched zone/now_playing
+        // to clamp against, so it relies on the client having already
+        // clamped to [0, track length] before sending (roon-knob's
+        // common/ui.c does).
+        "seek" => match value.and_then(|v| v.as_f64()) {
+            Some(position) if position.is_finite() && position >= 0.0 => {
+                Ok(Command::Seek { position })
+            }
+            Some(_) => Err(anyhow::anyhow!(
+                "seek position must be a non-negative number of seconds"
+            )),
+            None => Err(anyhow::anyhow!(
+                "seek requires a numeric position in seconds"
+            )),
+        },
         _ => Err(anyhow::anyhow!("Unknown action: {action}")),
     };
 

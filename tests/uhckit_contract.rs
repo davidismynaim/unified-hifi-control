@@ -126,6 +126,11 @@ fn sample_now_playing() -> NowPlayingResponse {
         zones: vec![],
         config_sha: None,
         zones_sha: Some("4bb54fbe".to_string()),
+        next_track_title: None,
+        next_track_artist: None,
+        album_year: None,
+        bit_info: None,
+        next_track_none: None,
     }
 }
 

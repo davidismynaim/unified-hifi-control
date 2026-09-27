@@ -31,8 +31,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mock_servers::roon_core::{
-    album, album_live, artist_live, playlist, playlist_live, radio_station, zone_with_grouping,
-    FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
+    album, album_live, artist_live, default_zone, playlist, playlist_live, radio_station,
+    zone_with_grouping, FakeItem, FakeLibrary, FakeRoonCore, Hint, ItemKeyScope,
 };
 use roon_api::browse::{BrowseOpts, LoadOpts};
 use unified_hifi_control::adapters::roon::{
@@ -295,6 +295,176 @@ async fn roon_core_publishes_zones() {
         .expect("output volume should survive deserialization");
     assert_eq!(volume.value, Some(50.0));
     assert_eq!(volume.max, Some(100.0));
+
+    core.stop().await;
+}
+
+/// A zone that is playing `title`, with `remaining` items still counted in its queue.
+fn playing_zone(zone_id: &str, title: &str, remaining: i64) -> serde_json::Value {
+    let mut zone = default_zone(zone_id, "Fake Dining Room");
+    zone["state"] = serde_json::json!("playing");
+    zone["queue_items_remaining"] = serde_json::json!(remaining);
+    zone["now_playing"] = serde_json::json!({
+        "one_line": { "line1": format!("{title} - Fake Artist") },
+        "two_line": { "line1": title, "line2": "Fake Artist" },
+        "three_line": { "line1": title, "line2": "Fake Artist", "line3": "Fake Album" },
+    });
+    zone
+}
+
+fn queue_item(id: u32, title: &str, artist: &str) -> serde_json::Value {
+    serde_json::json!({
+        "queue_item_id": id,
+        "length": 200,
+        "image_key": null,
+        "one_line": { "line1": format!("{title} - {artist}") },
+        "two_line": { "line1": title, "line2": artist },
+        "three_line": { "line1": title, "line2": artist, "line3": "Fake Album" },
+    })
+}
+
+async fn wait_for_queue_status(
+    adapter: &RoonAdapter,
+    zone_id: &str,
+    want: &str,
+    for_title: &str,
+) -> unified_hifi_control::adapters::roon_queue::QueueNextView {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let view = adapter.queue_next_for(zone_id).await;
+        if (view.status == want && view.for_title.as_deref() == Some(for_title))
+            || Instant::now() > deadline
+        {
+            return view;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The next track of a real queue comes from Roon's official `subscribe_queue`, asking for only a
+/// few items (the private protocol's `GetItems` returns the whole queue - 8000 items on a
+/// long-lived one), and is read again when the zone moves to a new track.
+#[tokio::test]
+async fn real_queue_next_track_is_read_through_the_official_api_and_follows_the_track() {
+    let core = FakeRoonCore::start().await;
+    core.set_zones(vec![playing_zone("zone_q", "Bloody Well Right", 7)])
+        .await;
+    core.set_queue_items(vec![
+        queue_item(1, "Bloody Well Right", "Supertramp"),
+        queue_item(2, "Hide In Your Shell", "Supertramp"),
+        queue_item(3, "Asylum", "Supertramp"),
+        queue_item(4, "Dreamer", "Supertramp"),
+    ])
+    .await;
+    let adapter = connected(&core).await;
+
+    let view = wait_for_queue_status(&adapter, "zone_q", "next", "Bloody Well Right").await;
+    assert_eq!(view.status, "next", "no next track was read: {view:?}");
+    assert_eq!(view.next_title.as_deref(), Some("Hide In Your Shell"));
+    assert_eq!(view.next_artist.as_deref(), Some("Supertramp"));
+    let asked = core.queue_requests().await;
+    assert!(
+        !asked.is_empty() && asked.iter().all(|n| *n <= 3),
+        "asked for too much: {asked:?}"
+    );
+
+    // The track changes: the queue is read again and the answer follows it.
+    core.push_zone_changed(playing_zone("zone_q", "Hide In Your Shell", 6))
+        .await;
+    let view = wait_for_queue_status(&adapter, "zone_q", "next", "Hide In Your Shell").await;
+    assert_eq!(view.for_title.as_deref(), Some("Hide In Your Shell"));
+    assert_eq!(view.next_title.as_deref(), Some("Asylum"));
+
+    core.stop().await;
+}
+
+/// Unknown is reported as unknown - never a guessed track - when the playing track is not among
+/// the items read, and a queue that has really ended is reported as `last`.
+#[tokio::test]
+async fn real_queue_next_track_is_unknown_when_it_cannot_be_established() {
+    let core = FakeRoonCore::start().await;
+    core.set_zones(vec![playing_zone("zone_q", "Playing", 1)])
+        .await;
+    core.set_queue_items(vec![queue_item(9, "Some other track", "X")])
+        .await;
+    let adapter = connected(&core).await;
+    let view = wait_for_queue_status(&adapter, "zone_q", "unknown", "Playing").await;
+    assert_eq!(view.status, "unknown");
+    assert_eq!(view.for_title.as_deref(), Some("Playing"));
+    assert!(view.next_title.is_none());
+
+    core.set_queue_items(vec![queue_item(1, "Playing", "X")])
+        .await;
+    core.push_zone_changed(playing_zone("zone_q", "Playing", 0))
+        .await;
+    let view = wait_for_queue_status(&adapter, "zone_q", "last", "Playing").await;
+    assert_eq!(view.status, "last", "end of queue not recognised: {view:?}");
+
+    core.stop().await;
+}
+
+/// The Dial's detail-screen seek-jog (roon-knob, encoder scrubs position) needs
+/// this: `RoonAdapter::seek` reaching the wire as an absolute-seconds request,
+/// not silently no-op'd. Before this, `control_roon`'s "seek" action had no
+/// Roon-side implementation at all - only HQPlayer's did - so a knob's seek
+/// command would 400 with "Unknown action" before ever reaching this adapter.
+#[tokio::test]
+async fn seek_sends_absolute_seconds_to_the_core() {
+    let core = FakeRoonCore::start().await;
+    let adapter = connected(&core).await;
+
+    // is_browse_connected() flipping true doesn't mean Transport's own
+    // connection is ready to send yet - subscribe_zones() is fired in the
+    // same CoreEvent::Registered handler as browse readiness, but there is
+    // a real window where it silently no-ops (see roon_core_publishes_zones,
+    // which works around exactly this by polling get_zones() rather than
+    // asserting immediately after connected()). Wait for a zone to actually
+    // arrive - the only observable proof Transport's subscription round trip
+    // completed - before exercising seek() on the same Transport.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while adapter.get_zones().await.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !adapter.get_zones().await.is_empty(),
+        "zone never arrived - Transport subscription did not complete"
+    );
+
+    adapter
+        .seek("zone_fake_1", 245)
+        .await
+        .expect("seek should reach the fake core");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut requests = core.requests_named("com.roonlabs.transport:2/seek").await;
+    while requests.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        requests = core.requests_named("com.roonlabs.transport:2/seek").await;
+    }
+    assert_eq!(requests.len(), 1, "expected exactly one seek request");
+    assert_eq!(
+        requests[0]
+            .body
+            .get("zone_or_output_id")
+            .and_then(serde_json::Value::as_str),
+        Some("zone_fake_1"),
+        "seek must target the requested zone, not an output or a stale id"
+    );
+    assert_eq!(
+        requests[0]
+            .body
+            .get("how")
+            .and_then(serde_json::Value::as_str),
+        Some("absolute"),
+        "the knob always previews and commits an absolute position, never a relative jump"
+    );
+    assert_eq!(
+        requests[0]
+            .body
+            .get("seconds")
+            .and_then(serde_json::Value::as_i64),
+        Some(245)
+    );
 
     core.stop().await;
 }
@@ -988,7 +1158,7 @@ async fn search_and_play_navigates_into_a_result_to_find_a_playable_action() {
         )
         .await
         .expect("search_and_play should find a playable action");
-    assert_eq!(message, "Play Now: Kind of Blue");
+    assert_eq!(message, "Play Now: Kind of Blue - Miles Davis");
 
     assert_eq!(
         core.browsed_titles().await,
@@ -1024,7 +1194,7 @@ async fn queue_and_radio_invoke_different_actions_than_play() {
         )
         .await
         .unwrap();
-    assert_eq!(queued, "Queue: Kind of Blue");
+    assert_eq!(queued, "Queue: Kind of Blue - Miles Davis");
 
     let invoked = core.browsed_titles().await;
     assert!(invoked.contains(&"Queue".to_string()), "got {invoked:?}");
@@ -1067,6 +1237,470 @@ async fn an_action_the_core_does_not_offer_is_reported_with_what_is_available() 
     assert!(
         text.contains("Play Now"),
         "should list what is available: {text}"
+    );
+
+    core.stop().await;
+}
+
+// =============================================================================
+// A search hit that does not match the request must not be played
+// =============================================================================
+
+/// Roon matches the WORDS of a query against titles, so "The Best of Goldfrapp" ranks Bob Marley's "The Best
+/// Of" compilation first. That used to be played and reported as a success. It must now be refused, name what
+/// Roon offered, and invoke no play action at all.
+#[tokio::test]
+async fn a_top_hit_by_the_wrong_artist_is_refused_and_nothing_is_played() {
+    let mut library = FakeLibrary::standard();
+    library.word_match_search = true; // like Roon: any word of the query can match
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![
+            FakeItem::list("Legend \u{2013} The Best Of Bob Marley & The Wailers")
+                .with_subtitle("[[41082|Bob Marley & The Wailers]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+        ],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let error = adapter
+        .search_and_play(
+            "The Best of Goldfrapp",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+        )
+        .await
+        .expect_err("a Bob Marley album is not what was asked for");
+    let text = error.to_string();
+    assert!(text.contains("No confident match"), "got {text}");
+    assert!(text.contains("nothing played"), "got {text}");
+    assert!(
+        text.contains("Bob Marley"),
+        "should name what Roon offered: {text}"
+    );
+    assert!(
+        text.contains("goldfrapp"),
+        "should name the missing word: {text}"
+    );
+
+    let invoked = core.browsed_titles().await;
+    assert!(
+        !invoked.contains(&"Play Now".to_string()),
+        "no play action may be invoked for a non-matching hit: {invoked:?}"
+    );
+
+    core.stop().await;
+}
+
+/// When a later result really is what was asked for, it is chosen over Roon's higher-ranked unrelated hit.
+#[tokio::test]
+async fn a_matching_result_is_chosen_over_a_higher_ranked_unrelated_one() {
+    let mut library = FakeLibrary::standard();
+    library.word_match_search = true; // like Roon: any word of the query can match
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![
+            FakeItem::list("Legend \u{2013} The Best Of Bob Marley & The Wailers")
+                .with_subtitle("[[41082|Bob Marley & The Wailers]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+            FakeItem::list("The Singles")
+                .with_subtitle("[[7|Goldfrapp]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+        ],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play(
+            "The Best of Goldfrapp",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+        )
+        .await
+        .expect("The Singles by Goldfrapp matches the request");
+    assert_eq!(message, "Play Now: The Singles - Goldfrapp");
+
+    let invoked = core.browsed_titles().await;
+    assert!(
+        invoked.contains(&"The Singles".to_string())
+            && !invoked.iter().any(|t| t.contains("Bob Marley")),
+        "must navigate into the Goldfrapp album only: {invoked:?}"
+    );
+
+    core.stop().await;
+}
+
+/// The Wish You Were Here failure: the artist-prefixed query made Roon rank a Various Artists TRACK literally
+/// titled "Pink Floyd Wish You Were Here" first, and it matched every word, so it was played. The Pink Floyd
+/// album sits in the Albums category and must win; `PlayKind::Track` (a single song was asked for) keeps the
+/// old top-hit behaviour.
+fn wish_you_were_here_library() -> FakeLibrary {
+    let mut library = FakeLibrary::standard();
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![
+            FakeItem::action_list("Pink Floyd Wish You Were Here")
+                .with_subtitle("Various Artists")
+                .with_children(vec![FakeItem::action("Play Now")]),
+            FakeItem::list("Tracks").with_children(vec![FakeItem::action_list(
+                "Wish You Were Here",
+            )
+            .with_subtitle("[[1|Pink Floyd]]")
+            .with_children(vec![FakeItem::action("Play Now")])]),
+            FakeItem::list("Albums").with_children(vec![
+                FakeItem::list("Wish You Were Here 50")
+                    .with_subtitle("[[1|Pink Floyd]]")
+                    .with_children(vec![FakeItem::action_list("Play Album")
+                        .with_children(vec![FakeItem::action("Play Now")])]),
+                FakeItem::list("Wish You Were Here")
+                    .with_subtitle("[[1|Pink Floyd]]")
+                    .with_children(vec![FakeItem::action_list("Play Album")
+                        .with_children(vec![FakeItem::action("Play Now")])]),
+            ]),
+        ],
+    );
+    library
+}
+
+#[tokio::test]
+async fn an_album_whose_title_is_in_the_query_beats_a_same_named_track() {
+    for query in ["Pink Floyd Wish You Were Here", "Wish You Were Here"] {
+        let core = FakeRoonCore::start_with(wish_you_were_here_library()).await;
+        let adapter = connected(&core).await;
+
+        let message = adapter
+            .search_and_play(
+                query,
+                "roon:zone_fake_1",
+                SearchSource::Library,
+                PlayAction::Play,
+            )
+            .await
+            .expect("the album is in the results");
+        // Roon's own order (this fixture lists "Wish You Were Here 50" first, matching live Roon's actual
+        // Albums-category order for this exact query) is trusted rather than second-guessed -- the point of
+        // this test is that an album is chosen over the same-named track at all, not which of two albums wins.
+        assert_eq!(
+            message, "Play Now: Wish You Were Here 50 - Pink Floyd",
+            "{query}"
+        );
+
+        core.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn the_artist_field_skips_a_query_mirroring_decoy_that_scoring_alone_fell_for() {
+    // Live regression: word-count ranking picked "wish you were here by pink floyd" credited to "genius genius"
+    // (a lyrics-video entry whose title just restates the query) over the real album, because it had zero
+    // unmatched words and more of them. An artist-identity check must skip it outright, even though Roon lists
+    // it before the real album.
+    let mut library = FakeLibrary::standard();
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![FakeItem::list("Albums").with_children(vec![
+            FakeItem::list("wish you were here by pink floyd")
+                .with_subtitle("[[1|genius genius]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+            FakeItem::list("Wish You Were Here 50")
+                .with_subtitle("[[2|Pink Floyd]]")
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+        ])],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play_kind(
+            "wish you were here pink floyd",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+            unified_hifi_control::adapters::roon::PlayKind::Auto,
+            Some("Pink Floyd"),
+        )
+        .await
+        .expect("the real album is in the results");
+    assert_eq!(
+        message, "Play Now: Wish You Were Here 50 - Pink Floyd",
+        "got {message}"
+    );
+
+    core.stop().await;
+}
+
+#[tokio::test]
+async fn kind_album_plays_the_album_and_never_a_track() {
+    let core = FakeRoonCore::start_with(wish_you_were_here_library()).await;
+    let adapter = connected(&core).await;
+    let message = adapter
+        .search_and_play_kind(
+            "Wish You Were Here Pink Floyd",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+            unified_hifi_control::adapters::roon::PlayKind::Album,
+            None,
+        )
+        .await
+        .expect("the album is in the Albums list");
+    // Roon's own order (this fixture lists "Wish You Were Here 50" first) is trusted rather than second-guessed.
+    assert_eq!(message, "Play Now: Wish You Were Here 50 - Pink Floyd");
+    assert!(core
+        .browsed_titles()
+        .await
+        .contains(&"Play Album".to_string()));
+    core.stop().await;
+
+    // No album in the results at all: refuse rather than play the track.
+    let mut library = FakeLibrary::standard();
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![FakeItem::action_list("Arrival")
+            .with_subtitle("[[2|ABBA]]")
+            .with_children(vec![FakeItem::action("Play Now")])],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+    let error = adapter
+        .search_and_play_kind(
+            "Arrival ABBA",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+            unified_hifi_control::adapters::roon::PlayKind::Album,
+            None,
+        )
+        .await
+        .expect_err("an explicit album request must not play a track");
+    assert!(error.to_string().contains("No confident match"), "{error}");
+    core.stop().await;
+}
+
+/// Live reproduction of the Breakfast In America failure: the real album is catalogued as "Breakfast In
+/// America (Deluxe Edition)", and Roon's Albums category surrounds it with many amateur covers/remixes titled
+/// plain "Breakfast in America" (no "Deluxe Edition"). Before the generic-word fix, only the covers passed the
+/// strict title check (the listener never said "deluxe edition"), so one of them won outright in the strict
+/// pass -- the loose pass, where weight would have correctly preferred the fuller official title, never even ran.
+fn breakfast_in_america_library() -> FakeLibrary {
+    let mut library = FakeLibrary::standard();
+    let real_album = FakeItem::list("Breakfast In America (Deluxe Edition)")
+        .with_subtitle("[[1|Supertramp]]")
+        .with_children(vec![FakeItem::action_list("Play Album").with_children(
+            vec![FakeItem::action("Play Now"), FakeItem::action("Queue")],
+        )]);
+    let mut covers = vec![real_album];
+    for artist in ["Viktor Sj\u{f6}berg", "Everlone", "Sho Zoe"] {
+        covers.push(
+            FakeItem::list("Breakfast in America")
+                .with_subtitle(&format!("[[9|{artist}]]"))
+                .with_children(vec![FakeItem::action_list("Play Album")
+                    .with_children(vec![FakeItem::action("Play Now")])]),
+        );
+    }
+    let albums_category = FakeItem::list("Albums").with_children(covers);
+    library
+        .search_results
+        .insert("Library".to_string(), vec![albums_category]);
+    library
+}
+
+#[tokio::test]
+async fn the_deluxe_edition_beats_the_amateur_covers_surrounding_it() {
+    let core = FakeRoonCore::start_with(breakfast_in_america_library()).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play(
+            "breakfast in america",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+        )
+        .await
+        .expect("the real album is in the results");
+    assert_eq!(
+        message, "Play Now: Breakfast In America (Deluxe Edition) - Supertramp",
+        "got {message}"
+    );
+
+    core.stop().await;
+}
+
+/// Live reproduction of the Arrival/ABBA failure: the "Albums" category's one, unambiguous result is not
+/// the album itself but an editions picker -- one more single-item "List" row repeating the same title -- before
+/// the real action menu ("Play Album" alongside every track). Without descending through it, nothing there
+/// looks playable at all, and the code fell all the way through to a Work-style top-level hit instead.
+fn arrival_library() -> FakeLibrary {
+    let mut library = FakeLibrary::standard();
+    let work_hit = FakeItem::action_list("Arrival")
+        .with_subtitle("Benny Andersson, Bj\u{f6}rn Ulvaeus, ABBA")
+        .with_children(vec![FakeItem::action("Play Now")]);
+    let album_menu = FakeItem::action_list("Play Album").with_children(vec![
+        FakeItem::action("Play Now"),
+        FakeItem::action("Add Next"),
+        FakeItem::action("Queue"),
+        FakeItem::action("Start Radio"),
+    ]);
+    let mut track_children = vec![album_menu];
+    for n in 1..=12 {
+        track_children.push(FakeItem::action_list(&format!("{n}. Track {n}")));
+    }
+    let edition = FakeItem::list("Arrival").with_children(track_children);
+    let album = FakeItem::list("Arrival")
+        .with_subtitle("[[706682|ABBA]]")
+        .with_children(vec![edition]);
+    let albums_category = FakeItem::list("Albums").with_children(vec![album]);
+    library
+        .search_results
+        .insert("Library".to_string(), vec![work_hit, albums_category]);
+    library
+}
+
+#[tokio::test]
+async fn the_real_album_is_found_behind_a_work_style_top_hit() {
+    let core = FakeRoonCore::start_with(arrival_library()).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play_kind(
+            "arrival abba",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Queue,
+            unified_hifi_control::adapters::roon::PlayKind::Album,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the album is right there in Albums: {e}"));
+    assert_eq!(message, "Queue: Arrival - ABBA", "got {message}");
+
+    core.stop().await;
+}
+
+/// Live Roon's own wrapper for a search-hit item repeats the item's own title rather than naming an action
+/// (unlike the mock library's "Play Album"), so it cannot be matched by name; the fix must still be entered to
+/// reach Play Now/Add Next/Queue/Start Radio, for actions other than the default Play too.
+fn same_titled_wrapper_library() -> FakeLibrary {
+    let mut library = FakeLibrary::standard();
+    let wrapper = FakeItem::action_list("Wish You Were Here")
+        .with_subtitle("[[1|Pink Floyd]]")
+        .with_children(vec![
+            FakeItem::action("Play Now"),
+            FakeItem::action("Add Next"),
+            FakeItem::action("Queue"),
+            FakeItem::action("Start Radio"),
+        ]);
+    let album = FakeItem::list("Wish You Were Here")
+        .with_subtitle("[[1|Pink Floyd]]")
+        .with_children(vec![wrapper]);
+    let albums_category = FakeItem::list("Albums").with_children(vec![album]);
+    library
+        .search_results
+        .insert("Library".to_string(), vec![albums_category]);
+    library
+}
+
+#[tokio::test]
+async fn queue_and_radio_still_work_through_a_same_titled_wrapper() {
+    for action in [PlayAction::Queue, PlayAction::Radio] {
+        let core = FakeRoonCore::start_with(same_titled_wrapper_library()).await;
+        let adapter = connected(&core).await;
+        let message = adapter
+            .search_and_play(
+                "Wish You Were Here",
+                "roon:zone_fake_1",
+                SearchSource::Library,
+                action,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{action:?} should reach the real menu: {e}"));
+        assert!(
+            message.contains("Wish You Were Here"),
+            "{action:?}: got {message}"
+        );
+        core.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn kind_track_plays_the_song_from_the_tracks_list_not_an_album() {
+    let core = FakeRoonCore::start_with(wish_you_were_here_library()).await;
+    let adapter = connected(&core).await;
+
+    let message = adapter
+        .search_and_play_kind(
+            "Wish You Were Here Pink Floyd",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+            unified_hifi_control::adapters::roon::PlayKind::Track,
+            None,
+        )
+        .await
+        .expect("the song is in the Tracks list");
+    assert_eq!(message, "Play Now: Wish You Were Here - Pink Floyd");
+
+    let invoked = core.browsed_titles().await;
+    assert!(
+        !invoked.contains(&"Play Album".to_string()),
+        "a song request must not open an album: {invoked:?}"
+    );
+
+    core.stop().await;
+}
+
+/// Today's Rolling Stones case: the request was the compilation "GRRR!", which is not in the library. Roon's top
+/// hit was a single TRACK by the right artist ("Live By The Sword", on Hackney Diamonds), which used to be played
+/// and announced as GRRR!. A track by the right artist is still not what was asked for: "grrr" is missing.
+#[tokio::test]
+async fn a_track_by_the_right_artist_is_not_the_album_that_was_asked_for() {
+    let mut library = FakeLibrary::standard();
+    library.word_match_search = true;
+    library.search_results.insert(
+        "Library".to_string(),
+        vec![FakeItem::list("Live By The Sword")
+            .with_subtitle("Mick Jagger, Keith Richards, [[5|The Rolling Stones]]")
+            .with_children(vec![FakeItem::action_list("Play Album")
+                .with_children(vec![FakeItem::action("Play Now")])])],
+    );
+    let core = FakeRoonCore::start_with(library).await;
+    let adapter = connected(&core).await;
+
+    let error = adapter
+        .search_and_play(
+            "GRRR! by The Rolling Stones",
+            "roon:zone_fake_1",
+            SearchSource::Library,
+            PlayAction::Play,
+        )
+        .await
+        .expect_err("GRRR! is not in the library; the track must not be played instead");
+    let text = error.to_string();
+    assert!(text.contains("nothing played"), "got {text}");
+    assert!(
+        text.contains("grrr"),
+        "should name the missing word: {text}"
+    );
+    assert!(
+        text.contains("Live By The Sword"),
+        "should name what Roon offered: {text}"
+    );
+    assert!(
+        !core
+            .browsed_titles()
+            .await
+            .contains(&"Play Now".to_string()),
+        "nothing may be played"
     );
 
     core.stop().await;

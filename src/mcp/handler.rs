@@ -58,7 +58,10 @@ impl ServerHandler for HifiMcpHandler {
         Ok(ListToolsResult {
             meta: None,
             next_cursor: None,
-            tools: tools::list_tools(settings.adapters.hqplayer),
+            tools: tools::without_hidden(
+                tools::list_tools(settings.adapters.hqplayer),
+                &tools::hidden_tools(),
+            ),
         })
     }
 
@@ -74,6 +77,13 @@ impl ServerHandler for HifiMcpHandler {
         // has to reach them too. `requested_tool_name` is captured first because
         // `try_from` consumes `params`.
         let requested = params.name.clone();
+        // An operator-hidden tool is not advertised, so refuse a call to it
+        // rather than let a client that cached the old list reach it.
+        if tools::hidden_tools().iter().any(|h| h == &requested) {
+            return Ok(CallToolResult::with_error(CallToolError::unknown_tool(
+                requested,
+            )));
+        }
         let tool: HifiTools = match HifiTools::try_from(params) {
             Ok(tool) => tool,
             Err(e) => {

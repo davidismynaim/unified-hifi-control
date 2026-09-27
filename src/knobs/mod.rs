@@ -14,6 +14,7 @@
 pub mod image;
 pub mod routes;
 pub mod store;
+pub mod zone_grace;
 
 pub use routes::*;
 pub use store::KnobStore;

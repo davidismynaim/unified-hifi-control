@@ -31,10 +31,12 @@
 
 pub mod command;
 pub mod consumer;
+pub mod dedupe;
 pub mod discovery;
 pub mod knob_command;
 pub mod knob_discovery;
 pub mod knob_state;
+pub mod roon_swim;
 pub mod state;
 pub mod topics;
 
@@ -42,6 +44,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use dedupe::MqttClient;
 use rumqttc::{AsyncClient, Event, LastWill, MqttOptions, Packet, QoS, Transport};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -69,6 +72,17 @@ pub const DEFAULT_BASE_TOPIC: &str = "unified-hifi";
 pub const DEFAULT_DISCOVERY_PREFIX: &str = "homeassistant";
 pub const DEFAULT_PORT: u16 = 1883;
 pub const DEFAULT_TLS_PORT: u16 = 8883;
+
+/// Capacity of the `rumqttc` request channel between `AsyncClient` and its event loop.
+///
+/// The `ConnAck` handler re-announces every zone and knob (discovery entities plus
+/// state, one awaited `publish` each) *inside* the arm that polls the event loop. While
+/// that handler runs nothing drains the channel, so an announce that queues more requests
+/// than this capacity blocks forever on the next `publish().await`: the loop is never
+/// polled again, pings stop, and the broker drops the client after 1.5x keepalive with no
+/// reconnect. It was 64, which 8 zones plus two subscriptions exceeded. Requests are tiny,
+/// so size for many zones rather than trusting the count to stay small.
+pub const REQUEST_CHANNEL_CAPACITY: usize = 4096;
 
 /// Whether the publisher is actually talking to a broker (#607).
 ///
@@ -203,6 +217,11 @@ pub struct MqttPublisher {
     /// survive the publisher being reconfigured, and the Supervisor poll
     /// task that writes to it runs whether or not the publisher is on.
     consumer: Arc<ConsumerMonitor>,
+    /// Latest data from the `roon-swim-bridge` sidecar (Radio next-track,
+    /// source format/bit-depth, release year), keyed by zone slug. See
+    /// `roon_swim` module doc for why that data comes in over MQTT from a
+    /// separate process rather than living in this binary.
+    roon_swim: roon_swim::RoonSwimStore,
 }
 
 /// Snapshot of publisher state for the settings API, deliberately excluding
@@ -265,6 +284,7 @@ impl MqttPublisher {
             runtime: Mutex::new(Runtime::default()),
             reliable_commands: std::sync::RwLock::new(None),
             consumer: Arc::new(ConsumerMonitor::new()),
+            roon_swim: roon_swim::RoonSwimStore::new(),
         }
     }
 
@@ -273,6 +293,13 @@ impl MqttPublisher {
     /// place the publisher's event loop records birth announcements.
     pub fn consumer_monitor(&self) -> Arc<ConsumerMonitor> {
         self.consumer.clone()
+    }
+
+    /// Shared handle onto the latest `roon-swim-bridge` data, read by
+    /// `knobs::routes::knob_now_playing_handler` to add next-track/format/
+    /// release-year fields to `/now_playing`.
+    pub fn roon_swim_store(&self) -> roon_swim::RoonSwimStore {
+        self.roon_swim.clone()
     }
 
     /// Attach the reliable command gateway (#529) so inbound HA commands for legacy
@@ -369,6 +396,7 @@ impl MqttPublisher {
             self.base_url_snapshot(),
             connection.clone(),
             self.consumer.clone(),
+            self.roon_swim.clone(),
             shutdown.clone(),
         ));
         let task = RunningTask {
@@ -500,7 +528,7 @@ fn mqtt_options(record: &MqttCredentialRecord, availability_topic: &str) -> Mqtt
 
 /// Publish HA discovery configs and the retained state topic for one zone.
 async fn publish_zone(
-    client: &AsyncClient,
+    client: &MqttClient,
     record: &MqttCredentialRecord,
     zone: &Zone,
     base_url: &str,
@@ -535,7 +563,7 @@ async fn publish_zone(
 }
 
 /// Clear every retained discovery/state topic a removed zone could have had.
-async fn retract_zone(client: &AsyncClient, record: &MqttCredentialRecord, zone_id: &str) {
+async fn retract_zone(client: &MqttClient, record: &MqttCredentialRecord, zone_id: &str) {
     for topic in discovery::discovery_topics_for_removal(&record.discovery_prefix, zone_id) {
         if let Err(error) = client
             .publish(topic, QoS::AtLeastOnce, true, Vec::new())
@@ -555,7 +583,7 @@ async fn retract_zone(client: &AsyncClient, record: &MqttCredentialRecord, zone_
 
 /// Publish HA discovery configs and the retained state topic for one knob.
 async fn publish_knob(
-    client: &AsyncClient,
+    client: &MqttClient,
     record: &MqttCredentialRecord,
     knob_id: &str,
     knob: &Knob,
@@ -593,7 +621,7 @@ async fn publish_knob(
 }
 
 /// Clear every retained discovery/state topic a removed knob could have had.
-async fn retract_knob(client: &AsyncClient, record: &MqttCredentialRecord, knob_id: &str) {
+async fn retract_knob(client: &MqttClient, record: &MqttCredentialRecord, knob_id: &str) {
     for topic in knob_discovery::discovery_topics_for_removal(&record.discovery_prefix, knob_id) {
         if let Err(error) = client
             .publish(topic, QoS::AtLeastOnce, true, Vec::new())
@@ -616,7 +644,7 @@ async fn retract_knob(client: &AsyncClient, record: &MqttCredentialRecord, knob_
 /// `knob_slugs` (used to route inbound commands) and returns the current
 /// zone id list so the caller can decide whether it changed.
 async fn announce_all_knobs(
-    client: &AsyncClient,
+    client: &MqttClient,
     record: &MqttCredentialRecord,
     knobs: &KnobStore,
     aggregator: &ZoneAggregator,
@@ -661,7 +689,7 @@ async fn announce_all_knobs(
 /// commands. Called on every fresh broker connection, since a new session
 /// has no retained knowledge of what this publisher already announced.
 async fn announce_all_zones(
-    client: &AsyncClient,
+    client: &MqttClient,
     record: &MqttCredentialRecord,
     aggregator: &ZoneAggregator,
     base_url: &str,
@@ -691,11 +719,26 @@ async fn announce_all_zones(
     if let Err(error) = client.subscribe(command_filter, QoS::AtLeastOnce).await {
         tracing::warn!("MQTT command subscription failed: {error}");
     }
+
+    // roon-swim-bridge (a separate process - see its README) publishes
+    // Radio next-track/format/release-year here; subscribe so `/now_playing`
+    // can surface it. Same per-connection timing as the command filter
+    // above: retained messages arrive immediately on a fresh subscribe.
+    let roon_swim_filter = format!("{}/roon_swim/+/state", record.base_topic);
+    if let Err(error) = client.subscribe(roon_swim_filter, QoS::AtLeastOnce).await {
+        tracing::warn!("MQTT roon_swim subscription failed: {error}");
+    }
+    // The sidecar's retained last-will status: `offline` (or a session that
+    // never announced `online`) is what stops us serving stale retained state.
+    let roon_swim_status = format!("{}/roon_swim_bridge/status", record.base_topic);
+    if let Err(error) = client.subscribe(roon_swim_status, QoS::AtLeastOnce).await {
+        tracing::warn!("MQTT roon_swim status subscription failed: {error}");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_bus_event(
-    client: &AsyncClient,
+    client: &MqttClient,
     record: &MqttCredentialRecord,
     aggregator: &ZoneAggregator,
     knobs: &KnobStore,
@@ -785,8 +828,27 @@ async fn handle_incoming_publish(
     knobs: &KnobStore,
     zone_slugs: &HashMap<String, String>,
     knob_slugs: &HashMap<String, String>,
+    roon_swim: &roon_swim::RoonSwimStore,
     publish: &rumqttc::Publish,
 ) {
+    if roon_swim::is_status_topic(&record.base_topic, &publish.topic) {
+        roon_swim.set_online(publish.payload.as_ref() == b"online");
+        return;
+    }
+
+    if let Some(slug) = roon_swim::parse_state_topic(&record.base_topic, &publish.topic) {
+        match serde_json::from_slice::<roon_swim::RoonSwimPayload>(&publish.payload) {
+            Ok(payload) => roon_swim.update(slug, payload).await,
+            Err(error) => {
+                // The sidecar is a separate, unversioned-protocol process
+                // (see its README) - a payload we cannot parse is treated
+                // as absence of data, never a reason to fail loudly here.
+                tracing::debug!(slug, %error, "unparseable roon_swim payload; ignoring");
+            }
+        }
+        return;
+    }
+
     if let Some((slug, action)) =
         knob_command::parse_command_topic(&record.base_topic, &publish.topic)
     {
@@ -860,11 +922,13 @@ async fn run(
     base_url: String,
     connection: Arc<ConnectionMonitor>,
     consumer: Arc<ConsumerMonitor>,
+    roon_swim: roon_swim::RoonSwimStore,
     shutdown: CancellationToken,
 ) {
     let availability_topic = topics::availability_topic(&record.base_topic);
     let options = mqtt_options(&record, &availability_topic);
-    let (client, mut eventloop) = AsyncClient::new(options, 64);
+    let (client, mut eventloop) = AsyncClient::new(options, REQUEST_CHANNEL_CAPACITY);
+    let client = MqttClient::new(client);
     let mut bus_rx = bus.subscribe();
     let mut zone_slugs: HashMap<String, String> = HashMap::new();
     let mut known_knob_ids: HashSet<String> = HashSet::new();
@@ -900,6 +964,8 @@ async fn run(
                         // The one moment we know entities are really
                         // reaching a broker (#607).
                         connection.connected();
+                        // A new session: the broker may hold none of what we published before.
+                        client.reset_dedupe();
                         // Listen for Home Assistant announcing itself on the
                         // same broker (#610). Re-subscribed on every fresh
                         // connection because a new MQTT session carries no
@@ -946,6 +1012,8 @@ async fn run(
                             consumer::parse_status_payload(&publish.payload)
                         {
                             consumer.observe(evidence);
+                            // Re-announce must actually resend everything, not be deduplicated.
+                            client.reset_dedupe();
                             // Home Assistant's own integration docs ask
                             // publishers to treat the birth message as the
                             // trigger to (re)send their discovery payloads.
@@ -988,6 +1056,7 @@ async fn run(
                             &knobs,
                             &zone_slugs,
                             &knob_slugs,
+                            &roon_swim,
                             &publish,
                         )
                         .await;
@@ -1065,5 +1134,21 @@ async fn run(
                 .await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod request_channel_tests {
+    use super::REQUEST_CHANNEL_CAPACITY;
+
+    #[test]
+    fn request_channel_is_large_enough_for_a_full_announce() {
+        // A fresh connection queues, per zone, up to ~2 image/sensor + 2 volume/mute + 4
+        // transport-button discovery entries plus a state publish, then knobs and
+        // subscriptions - all awaited from inside the event-loop arm, so if they exceed the
+        // channel the loop deadlocks (see REQUEST_CHANNEL_CAPACITY). Guard a generous fleet.
+        let per_zone = 10;
+        let fixed = 40; // availability, subscriptions, knob entities
+        assert!(REQUEST_CHANNEL_CAPACITY >= 20 * per_zone + fixed);
     }
 }

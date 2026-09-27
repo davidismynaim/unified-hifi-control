@@ -88,6 +88,36 @@ tool_box!(
     ]
 );
 
+/// Environment variable naming MCP tools to withhold from clients.
+///
+/// A comma-separated list of tool names. Empty or unset (the default) hides
+/// nothing. An operator uses it to narrow the surface a small voice model can
+/// choose from, for example so a title request can only take the guarded
+/// `hifi_play` path.
+pub const HIDDEN_TOOLS_ENV: &str = "UHC_MCP_HIDDEN_TOOLS";
+
+/// Parse a hidden-tools list: comma-separated, whitespace and empties ignored.
+pub fn parse_hidden_tools(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Tool names the operator has hidden (see [`HIDDEN_TOOLS_ENV`]).
+pub fn hidden_tools() -> Vec<String> {
+    std::env::var(HIDDEN_TOOLS_ENV)
+        .map(|raw| parse_hidden_tools(&raw))
+        .unwrap_or_default()
+}
+
+/// Drop every tool named in `hidden` from `tools`.
+pub fn without_hidden(mut tools: Vec<Tool>, hidden: &[String]) -> Vec<Tool> {
+    tools.retain(|t| !hidden.iter().any(|h| h == &t.name));
+    tools
+}
+
 /// Every tool name, as a `'static` string.
 ///
 /// `HifiTools::tools()` yields owned `String`s, but the envelope's `tool` field is
@@ -139,7 +169,7 @@ pub fn declared_params(tool: &str) -> &'static [&'static str] {
         "hifi_capabilities" => &["zone_id"],
         "hifi_control" => &["zone_id", "action", "value"],
         "hifi_search" => &["query", "zone_id", "source"],
-        "hifi_play" => &["query", "zone_id", "source", "action"],
+        "hifi_play" => &["query", "zone_id", "source", "action", "kind", "artist"],
         "hifi_play_ref" => &["ref", "zone_id", "action"],
         "hifi_queue" => &["zone_id", "action", "item_id", "position", "target_zone_id"],
         "hifi_collections" => &[
@@ -244,12 +274,78 @@ pub fn list_tools(hqplayer_enabled: bool) -> Vec<Tool> {
     if !hqplayer_enabled {
         tools.retain(|t| !t.name.starts_with("hifi_hqplayer"));
     }
+    apply_schema_overrides(&mut tools);
     tools
+}
+
+/// Patches advertised `inputSchema` entries the `JsonSchema` derive cannot
+/// represent correctly, post-generation.
+///
+/// `rust-mcp-macros`' derive is deliberately minimal (its own doc comment:
+/// "for more advanced features, consider schemars") and only special-cases
+/// String/bool/integers/floats/`serde_json::Number`/`Vec<T>`/`Option<T>`/
+/// nested-`JsonSchema` structs. Any other type - including
+/// `serde_json::Value`, which is the only representation that can hold
+/// `HifiAppleMusicTool::precondition`'s real shape (a nested object like
+/// `{"playlist_version": 3}` - see `apple_bridge.rs`'s own test for that
+/// exact value) - falls into its hardcoded fallback, `{"type": "unknown"}`.
+/// That is not a valid JSON Schema type, and Home Assistant's MCP schema
+/// converter rejects it outright, breaking HA voice control for every tool,
+/// not just this one, since HA reads `tools/list` as a whole.
+///
+/// Fixing this by narrowing `precondition`'s real Rust type would
+/// misrepresent the actual contract with the Apple Music companion app, and
+/// patching the vendored derive is out of scope for a schema-advertisement
+/// bug. Overriding just this one field's advertised schema text - the real
+/// serde type, wire format, and runtime behavior are all untouched - is the
+/// narrow, correct fix.
+///
+/// [`tests::no_advertised_schema_uses_the_invalid_unknown_type`] is the
+/// regression test: it scans every tool this function has already run on,
+/// so a future tool that hits the same derive gap fails loudly here rather
+/// than silently breaking HA again.
+fn apply_schema_overrides(tools: &mut [Tool]) {
+    for tool in tools.iter_mut() {
+        if tool.name != "hifi_apple_music" {
+            continue;
+        }
+        let Some(properties) = tool.input_schema.properties.as_mut() else {
+            continue;
+        };
+        let Some(schema) = serde_json::json!({
+            "type": "object",
+            "nullable": true,
+            "description": "Read-before-write revision or ownership precondition."
+        })
+        .as_object()
+        .cloned() else {
+            continue;
+        };
+        properties.insert("precondition".to_string(), schema);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_tools_list_parses_and_filters() {
+        assert!(parse_hidden_tools("").is_empty());
+        assert_eq!(
+            parse_hidden_tools(" hifi_search, ,hifi_play_ref,"),
+            vec!["hifi_search".to_string(), "hifi_play_ref".to_string()]
+        );
+        let hidden = parse_hidden_tools("hifi_search,hifi_play_ref,hifi_collections");
+        let kept = without_hidden(list_tools(true), &hidden);
+        assert_eq!(kept.len(), list_tools(true).len() - 3);
+        assert!(kept.iter().all(|t| !hidden.contains(&t.name)));
+        assert!(kept.iter().any(|t| t.name == "hifi_play"));
+        assert_eq!(
+            without_hidden(list_tools(true), &[]).len(),
+            list_tools(true).len()
+        );
+    }
 
     #[test]
     fn advertises_nineteen_tools_when_hqplayer_is_enabled() {
@@ -342,5 +438,32 @@ mod tests {
             static_param("hifi_now_playing", "missing field `query`"),
             None
         );
+    }
+
+    /// `rust-mcp-macros`' `JsonSchema` derive falls back to `{"type":
+    /// "unknown"}` for any type it doesn't special-case (see
+    /// `apply_schema_overrides`'s doc comment) - not a valid JSON Schema
+    /// type, and exactly what broke Home Assistant's MCP schema converter
+    /// for `hifi_apple_music.precondition`. `apply_schema_overrides` fixes
+    /// that one known case; this test is the regression guard so a
+    /// *future* tool field that hits the same derive gap fails a build
+    /// instead of silently breaking HA voice control again.
+    #[test]
+    fn no_advertised_schema_uses_the_invalid_unknown_type() {
+        for tool in list_tools(true) {
+            let Some(properties) = &tool.input_schema.properties else {
+                continue;
+            };
+            for (field, schema) in properties {
+                assert_ne!(
+                    schema.get("type").and_then(|t| t.as_str()),
+                    Some("unknown"),
+                    "{}.{} advertises the invalid JSON Schema type \"unknown\" - \
+                     add an apply_schema_overrides() entry for it",
+                    tool.name,
+                    field
+                );
+            }
+        }
     }
 }
