@@ -3021,29 +3021,16 @@ impl RoonAdapter {
                 ..Default::default()
             })
             .await?;
-        // When the artist is known separately, trust Roon's own ordering and just require it actually be that
-        // artist (`roon_match::subtitle_names_artist` -- an identity check, not word overlap, so a tribute or
-        // "performs" credit is excluded rather than merely discounted). Only fall back to word-count ranking
-        // (`roon_match::rank_candidate`) when there is no artist to check against: that scoring turned out to be
-        // fooled by a "lyrics video" entry whose title just restates the query -- three separate live bugs
-        // (Wish You Were Here, Arrival, Breakfast In America) already showed staged word-matching keeps needing
-        // a new patch for each new shape of Roon catalogue noise; an artist identity check does not.
+        // Roon's own order, the hard word-gate, and an artist-identity check when `artist` is known -- see
+        // `roon_match::best_candidate`'s doc comment for why there is no scoring on top of that.
         let candidates = albums.items.iter().filter(|item| item.item_key.is_some());
-        let album = match artist {
-            Some(artist) => roon_match::best_candidate_for_artist(
-                query,
-                artist,
-                candidates,
-                |item| item.title.as_str(),
-                |item| item.subtitle.as_deref(),
-            ),
-            None => roon_match::best_candidate(
-                query,
-                candidates,
-                |item| item.title.as_str(),
-                |item| item.subtitle.as_deref(),
-            ),
-        };
+        let album = roon_match::best_candidate(
+            query,
+            artist,
+            candidates,
+            |item| item.title.as_str(),
+            |item| item.subtitle.as_deref(),
+        );
         let Some(album) = album else {
             return Ok(None);
         };

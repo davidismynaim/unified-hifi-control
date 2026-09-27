@@ -1384,8 +1384,11 @@ async fn an_album_whose_title_is_in_the_query_beats_a_same_named_track() {
             )
             .await
             .expect("the album is in the results");
+        // Roon's own order (this fixture lists "Wish You Were Here 50" first, matching live Roon's actual
+        // Albums-category order for this exact query) is trusted rather than second-guessed -- the point of
+        // this test is that an album is chosen over the same-named track at all, not which of two albums wins.
         assert_eq!(
-            message, "Play Now: Wish You Were Here - Pink Floyd",
+            message, "Play Now: Wish You Were Here 50 - Pink Floyd",
             "{query}"
         );
 
@@ -1450,7 +1453,8 @@ async fn kind_album_plays_the_album_and_never_a_track() {
         )
         .await
         .expect("the album is in the Albums list");
-    assert_eq!(message, "Play Now: Wish You Were Here - Pink Floyd");
+    // Roon's own order (this fixture lists "Wish You Were Here 50" first) is trusted rather than second-guessed.
+    assert_eq!(message, "Play Now: Wish You Were Here 50 - Pink Floyd");
     assert!(core
         .browsed_titles()
         .await
