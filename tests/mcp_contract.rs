@@ -528,8 +528,8 @@ async fn tools_list_matches_fixture() {
 
     assert_eq!(
         tools.len(),
-        19,
-        "expected 19 tools with HQPlayer enabled, got {}: {:?}",
+        20,
+        "expected 20 tools with HQPlayer enabled, got {}: {:?}",
         tools.len(),
         tool_names(tools)
     );
@@ -599,6 +599,8 @@ async fn tools_list_order_is_pinned() {
             "hifi_zone_group",
             "hifi_hqplayer_outputs",
             "hifi_hqplayer_output_control",
+            // Appended for hifi_play_many.
+            "hifi_play_many",
         ],
         "tools/list order follows the tool_box! list in src/mcp/tools/mod.rs. \
          APPEND new tools rather than inserting, so this assertion grows by one \
@@ -646,6 +648,7 @@ async fn hqplayer_tools_filtered_when_adapter_disabled() {
             "hifi_apple_music",
             "hifi_collections",
             "hifi_zone_group",
+            "hifi_play_many",
         ],
         "HQPlayer disabled must yield exactly the non-HQPlayer tools, in order"
     );
@@ -916,6 +919,13 @@ const EXPECTED_TOOL_PARAMS: &[(&str, &[(&str, bool)])] = &[
             ("adapter_name", false),
         ],
     ),
+    // hifi_play_many: queue several tracks in one call, so a curated list no
+    // longer costs one hifi_play call per track against Home Assistant's own
+    // conversation-agent tool-call cap.
+    (
+        "hifi_play_many",
+        &[("zone_id", true), ("items", true), ("action", false)],
+    ),
 ];
 
 #[tokio::test]
@@ -1078,7 +1088,7 @@ async fn a_stale_session_id_is_transparently_recovered() {
         .unwrap_or_else(|| panic!("recovered request must return the tool list, got: {response}"));
     assert_eq!(
         tools.len(),
-        19,
+        20,
         "the recovered session must serve the same tool list as a fresh one"
     );
 }

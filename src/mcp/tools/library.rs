@@ -54,7 +54,7 @@ use crate::mcp::refs::{RefTarget, RoonRefTarget};
 use crate::mcp::routing::{
     unplaceable_zone_refusal, unplaceable_zone_text, LibraryRoute, ZoneTarget,
 };
-use crate::mcp::types::{McpPlayResult, McpSearchResult};
+use crate::mcp::types::{McpPlayManyItemResult, McpPlayManyResult, McpPlayResult, McpSearchResult};
 use rust_mcp_sdk::{
     macros::{mcp_tool, JsonSchema},
     schema::{schema_utils::CallToolError, CallToolResult},
@@ -134,6 +134,46 @@ pub struct HifiPlayRefTool {
     /// Zone ID to play on (get from hifi_zones). Must be the same provider the ref was minted for.
     pub zone_id: String,
     /// What to do: "play" (default), "queue", "radio" (Roon only), or "next" (LMS play-next only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+}
+
+/// One item of a [`HifiPlayManyTool`] request.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct HifiPlayManyItem {
+    /// The track (or album) title to search for.
+    pub query: String,
+    /// The artist's name, when known, matched by identity against each candidate (not by word
+    /// overlap) — the same reasoning as `hifi_play`'s own `artist` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artist: Option<String>,
+    /// "track" (or "song") when the request named a track, "album" when it named an album;
+    /// leave unset otherwise, in which case an album is preferred over a same-named track.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// Play or queue several tracks in one call (#hifi_play_many)
+///
+/// Added because a voice agent chaining one `hifi_play` call per track in a curated list hits
+/// Home Assistant's own conversation-agent tool-call cap (`MAX_TOOL_ITERATIONS=10`) past about
+/// seven tracks once the fixed overhead calls (resolving the request, reading zones, reading
+/// live context) are counted — it then fails partway through with no way to tell the listener
+/// what actually landed. This tool costs one MCP round trip regardless of list length. Roon
+/// only for v1: reuses [`crate::adapters::roon::Roon::search_and_play_kind`]'s existing per-item
+/// match-guard (swim15/16) completely unchanged, called once per item rather than refactored.
+#[mcp_tool(
+    name = "hifi_play_many",
+    description = "Play or queue several tracks in one call, for a curated list of songs (for example the TRACKS result of Assist: Resolve music request). Roon only. The first item uses `action` (default 'play'); every other item is always queued regardless of `action`, so a list of several tracks can never each restart playback. Each item is matched the same way hifi_play matches a single query: set `artist` on an item whenever it is known (matched by identity, not word overlap) and `kind` ('track' or 'album') when known. An item with no confident match is skipped and reported as not found; it does not fail the rest of the list. The reply's `summary` names exactly what happened, for example '13 of 15 queued; 2 not found: X, Y' — report only what it says, never assume every requested title landed."
+)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+pub struct HifiPlayManyTool {
+    /// Zone ID to play on (get from hifi_zones). Roon only.
+    pub zone_id: String,
+    /// The tracks to play or queue, in the order they should end up in the queue. Must not be empty.
+    pub items: Vec<HifiPlayManyItem>,
+    /// What to do with the first item: "play" (default) or "queue". Every other item is always
+    /// queued regardless of this value.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
 }
@@ -899,6 +939,118 @@ pub async fn handle_play(
             "internal routing error: a refused zone reached library dispatch. This is a UHC bug.",
         ),
     }
+}
+
+/// Play or queue several tracks against a Roon zone in one call. See
+/// [`HifiPlayManyTool`]'s own doc comment for why this tool exists.
+///
+/// Non-Roon zones are refused outright (`Refusal::NotImplemented`, not
+/// `ProviderLimitation`): LMS, Spotify, Music Assistant and Apple Music can all
+/// already play/queue one item at a time through `hifi_play`, so a batch call
+/// failing here is UHC not having wired it up yet, not a protocol limitation of
+/// those providers — the honest distinction #392's rule 3 draws.
+pub async fn handle_play_many(
+    state: &AppState,
+    args: HifiPlayManyTool,
+) -> Result<CallToolResult, CallToolError> {
+    let target = ZoneTarget::classify(&args.zone_id);
+    let route = target.for_library();
+
+    let env = Envelope::write("hifi_play_many", "play_many")
+        .param("zone_id", &*args.zone_id)
+        .param("item_count", args.items.len() as i64)
+        .scope(Scope::for_zone(state, &args.zone_id, target.provider()).await);
+
+    if !matches!(route, LibraryRoute::Roon) {
+        return env.refused(
+            "hifi_play_many only supports Roon zones today.",
+            Refusal::NotImplemented {
+                operation: "play_many".to_string(),
+                tracked_by: "hifi_play_many v1",
+                alternatives: vec!["hifi_play (one call per track)".to_string()],
+                detail: "Queuing several tracks in one call is wired up for Roon only so far. \
+                         Other providers can still be played or queued one track at a time \
+                         through hifi_play."
+                    .to_string(),
+            },
+        );
+    }
+
+    if args.items.is_empty() {
+        return env.failed("hifi_play_many: items must not be empty.");
+    }
+
+    use crate::adapters::roon::{PlayAction, PlayKind, SearchSource};
+
+    let first_action = PlayAction::parse(args.action.as_deref().unwrap_or("play"));
+    let total = args.items.len();
+    let mut queued = Vec::with_capacity(total);
+    let mut ok_count = 0usize;
+    let mut not_found = Vec::new();
+
+    for (i, item) in args.items.iter().enumerate() {
+        // Every item after the first is always queued: playing several "play"
+        // actions in a row would each restart playback from that item, which
+        // is never what a curated list means.
+        let action = if i == 0 {
+            first_action
+        } else {
+            PlayAction::Queue
+        };
+        let kind = match item.kind.as_deref() {
+            Some("track" | "song") => PlayKind::Track,
+            Some("album") => PlayKind::Album,
+            _ => PlayKind::Auto,
+        };
+        match state
+            .roon
+            .search_and_play_kind(
+                &item.query,
+                &args.zone_id,
+                SearchSource::Library,
+                action,
+                kind,
+                item.artist.as_deref(),
+            )
+            .await
+        {
+            Ok(message) => {
+                ok_count += 1;
+                queued.push(McpPlayManyItemResult {
+                    query: item.query.clone(),
+                    outcome: "ok",
+                    message,
+                });
+            }
+            Err(e) => {
+                not_found.push(item.query.clone());
+                queued.push(McpPlayManyItemResult {
+                    query: item.query.clone(),
+                    outcome: "error",
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+
+    let summary = if not_found.is_empty() {
+        format!("{ok_count} of {total} queued.")
+    } else {
+        format!(
+            "{ok_count} of {total} queued; {} not found: {}.",
+            not_found.len(),
+            not_found.join(", ")
+        )
+    };
+
+    let observed = Observed::from_aggregator(state, &args.zone_id).await;
+    Ok(env
+        .data(&McpPlayManyResult {
+            queued,
+            summary: summary.clone(),
+        })
+        .observed(observed)
+        .text_result(summary))
 }
 
 /// Finish a successful `hifi_play` or `hifi_play_ref`: the adapter's message

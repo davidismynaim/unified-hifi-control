@@ -110,6 +110,24 @@ pub struct McpPlayResult {
     pub message: String,
 }
 
+/// One item's outcome within `hifi_play_many`'s structured payload.
+#[derive(Debug, Serialize)]
+pub struct McpPlayManyItemResult {
+    pub query: String,
+    /// "ok" or "error" — a plain string rather than a bool so the field inventory in
+    /// `tests/mcp_contract.rs` reaches it the same way every other envelope string does.
+    pub outcome: &'static str,
+    pub message: String,
+}
+
+/// `hifi_play_many`'s structured payload: one entry per requested item, plus the spoken-ready
+/// `summary` that names exactly how many landed and which titles did not match.
+#[derive(Debug, Serialize)]
+pub struct McpPlayManyResult {
+    pub queued: Vec<McpPlayManyItemResult>,
+    pub summary: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct McpHqpStatus {
     pub connected: bool,
