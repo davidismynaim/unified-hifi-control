@@ -55,7 +55,8 @@ use unified_hifi_control::coordinator::AdapterCoordinator;
 use unified_hifi_control::knobs::KnobStore;
 use unified_hifi_control::mcp::tools::collections::{handle_collections, HifiCollectionsTool};
 use unified_hifi_control::mcp::tools::library::{
-    handle_play_ref, handle_search, HifiPlayRefTool, HifiSearchTool,
+    handle_play_many, handle_play_ref, handle_search, HifiPlayManyItem, HifiPlayManyTool,
+    HifiPlayRefTool, HifiSearchTool,
 };
 
 // =============================================================================
@@ -1431,5 +1432,223 @@ async fn a_rejected_cached_pair_re_walks_once_and_retries_in_place() {
         library.resolve_calls(),
         1,
         "the fresh pair must have been cached by the re-walk"
+    );
+}
+
+// =============================================================================
+// hifi_play_many: queue several tracks in one call
+//
+// Added so a voice agent chaining one hifi_play call per track no longer hits
+// Home Assistant's own conversation-agent tool-call cap (MAX_TOOL_ITERATIONS=10)
+// on a curated list past about seven tracks. `handle_play_many` reuses
+// `search_and_play_kind` per item unchanged (its own match-guard behaviour is
+// already covered by tests/roon_protocol.rs), so these tests exercise the new
+// code specifically: the first-item-plays/rest-always-queue rule, and honest
+// partial-success reporting -- not Roon matching itself.
+// =============================================================================
+
+fn play_many_item(query: &str) -> HifiPlayManyItem {
+    HifiPlayManyItem {
+        query: query.to_string(),
+        artist: None,
+        kind: None,
+    }
+}
+
+fn play_many_args(zone_id: &str, items: Vec<HifiPlayManyItem>) -> HifiPlayManyTool {
+    HifiPlayManyTool {
+        zone_id: zone_id.to_string(),
+        items,
+        action: None,
+    }
+}
+
+/// `FakeLibrary::standard()`'s own two flat, directly-playable "Library" search
+/// hits (`tests/mock_servers/roon_core.rs::FakeLibrary::standard`) -- the same
+/// shape `search_and_play_navigates_into_a_result_to_find_a_playable_action`
+/// (`tests/roon_protocol.rs`) already proves plays correctly with `PlayKind::Auto`
+/// and no artist filter. Reusing it rather than building a custom fixture keeps
+/// these tests about the new aggregation code, not about re-proving Roon
+/// matching (already covered there) -- an explicit `kind` of "album" needs its
+/// candidates wrapped in an "Albums" category row (see
+/// `wish_you_were_here_library`), which is deliberately not what these tests
+/// are checking.
+#[tokio::test]
+async fn play_many_queues_every_item_in_order_when_all_match() {
+    let core = FakeRoonCore::start_with(mock_servers::roon_core::FakeLibrary::standard()).await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let items = vec![play_many_item("Kind of Blue"), play_many_item("Blue Train")];
+    let result = handle_play_many(&state, play_many_args("roon:zone_fake_1", items)).await;
+
+    assert_eq!(outcome_of(&result), "accepted", "{}", text_of(&result));
+    let data = structured_of(&result)["data"].clone();
+    assert_eq!(
+        data["summary"], "2 of 2 queued.",
+        "got summary {:?}",
+        data["summary"]
+    );
+    let queued = data["queued"].as_array().expect("queued must be an array");
+    assert_eq!(queued.len(), 2);
+    assert!(queued.iter().all(|i| i["outcome"] == "ok"), "{queued:?}");
+    // The first item is played, not queued; every later item is always
+    // queued -- provable from the adapter's own message wording.
+    assert!(
+        queued[0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Play Now:"),
+        "first item must play: {:?}",
+        queued[0]["message"]
+    );
+    for later in &queued[1..] {
+        assert!(
+            later["message"].as_str().unwrap().starts_with("Queue:"),
+            "every item after the first must queue, never play: {later:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn play_many_reports_partial_success_honestly() {
+    let core = FakeRoonCore::start_with(mock_servers::roon_core::FakeLibrary::standard()).await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let items = vec![
+        play_many_item("Kind of Blue"),
+        play_many_item("Nonexistent Album Nobody Made"),
+        play_many_item("Blue Train"),
+    ];
+    let result = handle_play_many(&state, play_many_args("roon:zone_fake_1", items)).await;
+
+    assert_eq!(
+        outcome_of(&result),
+        "accepted",
+        "a partial match is still an overall accepted -- only an empty list or a refused \
+         zone should fail the whole call: {}",
+        text_of(&result)
+    );
+    let data = structured_of(&result)["data"].clone();
+    assert_eq!(
+        data["summary"], "2 of 3 queued; 1 not found: Nonexistent Album Nobody Made.",
+        "got summary {:?}",
+        data["summary"]
+    );
+    let queued = data["queued"].as_array().expect("queued must be an array");
+    assert_eq!(queued.len(), 3, "every requested item gets a result row");
+    assert_eq!(queued[0]["outcome"], "ok");
+    assert_eq!(queued[1]["outcome"], "error");
+    assert_eq!(queued[2]["outcome"], "ok");
+    // The miss must not stop the rest of the list from being attempted.
+    assert!(
+        queued[2]["message"].as_str().unwrap().starts_with("Queue:"),
+        "the item after a miss must still be attempted: {:?}",
+        queued[2]
+    );
+}
+
+#[tokio::test]
+async fn play_many_reports_summary_when_nothing_matches() {
+    let core = FakeRoonCore::start_with(mock_servers::roon_core::FakeLibrary::standard()).await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let items = vec![
+        play_many_item("Totally Unknown Track One"),
+        play_many_item("Totally Unknown Track Two"),
+    ];
+    let result = handle_play_many(&state, play_many_args("roon:zone_fake_1", items)).await;
+
+    assert_eq!(outcome_of(&result), "accepted", "{}", text_of(&result));
+    let data = structured_of(&result)["data"].clone();
+    assert_eq!(
+        data["summary"],
+        "0 of 2 queued; 2 not found: Totally Unknown Track One, Totally Unknown Track Two.",
+        "got summary {:?}",
+        data["summary"]
+    );
+    let queued = data["queued"].as_array().expect("queued must be an array");
+    assert!(queued.iter().all(|i| i["outcome"] == "error"), "{queued:?}");
+}
+
+#[tokio::test]
+async fn play_many_refuses_an_empty_item_list() {
+    let core = FakeRoonCore::start_with(mock_servers::roon_core::FakeLibrary::standard()).await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let result = handle_play_many(&state, play_many_args("roon:zone_fake_1", vec![])).await;
+
+    assert_eq!(
+        outcome_of(&result),
+        "error",
+        "an empty list must be refused outright, not silently succeed with nothing queued: {}",
+        text_of(&result)
+    );
+}
+
+#[tokio::test]
+async fn play_many_truncates_a_list_over_the_item_cap_with_a_note() {
+    let core = FakeRoonCore::start_with(mock_servers::roon_core::FakeLibrary::standard()).await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let items: Vec<_> = (0..51).map(|i| play_many_item(&format!("Track {i}"))).collect();
+    let result = handle_play_many(&state, play_many_args("roon:zone_fake_1", items)).await;
+
+    assert_eq!(
+        outcome_of(&result),
+        "accepted",
+        "51 items is one over the 50 cap, but the request still runs, truncated -- a \
+         caller asking for a long list (e.g. two hours of party music) should get a \
+         usable queue, not nothing: {}",
+        text_of(&result)
+    );
+    let data = structured_of(&result)["data"].clone();
+    let queued = data["queued"].as_array().expect("queued must be an array");
+    assert_eq!(
+        queued.len(),
+        5,
+        "only the sync window (5 items) is confirmed in this call, even within a capped list"
+    );
+    let summary = data["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("51 were requested; capped at 50 per call"),
+        "summary must say plainly that the list was cut down, got {summary:?}"
+    );
+    assert!(
+        summary.contains("45 more queuing now in the background"),
+        "summary must say plainly how many of the (capped) 50 are still in flight, got {summary:?}"
+    );
+}
+
+#[tokio::test]
+async fn play_many_refuses_a_non_roon_zone_as_not_yet_implemented() {
+    let core = FakeRoonCore::start_with(mock_servers::roon_core::FakeLibrary::standard()).await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let items = vec![play_many_item("Kind of Blue")];
+    // No LMS adapter is connected in `app_state_with_roon`, but the zone_id
+    // prefix alone is enough to route -- and must be refused as "not
+    // implemented for this provider yet", not misreported as a Roon
+    // protocol limitation (#392 rule 3: those are different claims).
+    let result = handle_play_many(&state, play_many_args("lms:fake_player", items)).await;
+
+    assert_eq!(
+        outcome_of(&result),
+        "unsupported",
+        "NotImplemented maps to Outcome::Unsupported, not Error -- this is a gap, not a \
+         failed attempt: {}",
+        text_of(&result)
+    );
+    assert_eq!(
+        refusal_reason_of(&result).as_deref(),
+        Some("not_implemented"),
+        "a provider UHC hasn't wired this tool up to yet must say so, not claim \
+         the protocol itself cannot do it: {}",
+        text_of(&result)
     );
 }

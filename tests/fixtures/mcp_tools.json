@@ -447,6 +447,53 @@
       "type": "object"
     }
   },
+  "hifi_play_many": {
+    "description": "Play or queue several tracks in one call, for a curated list of songs (for example the TRACKS result of Assist: Resolve music request). Roon only. The first item uses `action` (default 'play'); every other item is always queued regardless of `action`, so a list of several tracks can never each restart playback. Each item is matched the same way hifi_play matches a single query: set `artist` on an item whenever it is known (matched by identity, not word overlap) and `kind` ('track' or 'album') when known. An item with no confident match is skipped and reported as not found; it does not fail the rest of the list. A list over 50 items is truncated to the first 50 rather than refused — the reply's `summary` says so plainly when it happens. Only the first several items of a long list are confirmed before this call returns; any remainder keeps queuing in the background afterwards and is NOT yet confirmed — the `summary` says exactly how many are still in flight when this happens, for example '5 of 15 queued so far; 10 more queuing now in the background, not yet confirmed.' Report whatever the summary says plainly, including an in-flight remainder — never claim or imply the rest has already queued.",
+    "inputSchema": {
+      "properties": {
+        "action": {
+          "description": "What to do with the first item: \"play\" (default) or \"queue\". Every other item is always\nqueued regardless of this value.",
+          "nullable": true,
+          "type": "string"
+        },
+        "items": {
+          "description": "The tracks to play or queue, in the order they should end up in the queue. Must not be empty.",
+          "items": {
+            "properties": {
+              "artist": {
+                "description": "The artist's name, when known, matched by identity against each candidate (not by word\noverlap) — the same reasoning as `hifi_play`'s own `artist` field.",
+                "nullable": true,
+                "type": "string"
+              },
+              "kind": {
+                "description": "\"track\" (or \"song\") when the request named a track, \"album\" when it named an album;\nleave unset otherwise, in which case an album is preferred over a same-named track.",
+                "nullable": true,
+                "type": "string"
+              },
+              "query": {
+                "description": "The track (or album) title to search for.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "zone_id": {
+          "description": "Zone ID to play on (get from hifi_zones). Roon only.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "zone_id",
+        "items"
+      ],
+      "type": "object"
+    }
+  },
   "hifi_play_ref": {
     "annotations": {
       "readOnlyHint": false

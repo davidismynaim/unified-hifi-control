@@ -144,6 +144,9 @@ impl ServerHandler for HifiMcpHandler {
             HifiTools::HifiHqplayerOutputControlTool(args) => {
                 tools::hqp_outputs::handle_output_control(state, args).await
             }
+            HifiTools::HifiPlayManyTool(args) => {
+                tools::library::handle_play_many(state, args).await
+            }
         }
     }
 
