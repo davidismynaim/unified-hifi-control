@@ -61,6 +61,7 @@ use rust_mcp_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::time::Duration;
 
 /// How many results to request from LMS.
 ///
@@ -139,7 +140,7 @@ pub struct HifiPlayRefTool {
 }
 
 /// One item of a [`HifiPlayManyTool`] request.
-#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct HifiPlayManyItem {
     /// The track (or album) title to search for.
     pub query: String,
@@ -164,7 +165,7 @@ pub struct HifiPlayManyItem {
 /// match-guard (swim15/16) completely unchanged, called once per item rather than refactored.
 #[mcp_tool(
     name = "hifi_play_many",
-    description = "Play or queue several tracks in one call, for a curated list of songs (for example the TRACKS result of Assist: Resolve music request). Roon only. The first item uses `action` (default 'play'); every other item is always queued regardless of `action`, so a list of several tracks can never each restart playback. Each item is matched the same way hifi_play matches a single query: set `artist` on an item whenever it is known (matched by identity, not word overlap) and `kind` ('track' or 'album') when known. An item with no confident match is skipped and reported as not found; it does not fail the rest of the list. The reply's `summary` names exactly what happened, for example '13 of 15 queued; 2 not found: X, Y' — report only what it says, never assume every requested title landed."
+    description = "Play or queue several tracks in one call, for a curated list of songs (for example the TRACKS result of Assist: Resolve music request). Roon only. The first item uses `action` (default 'play'); every other item is always queued regardless of `action`, so a list of several tracks can never each restart playback. Each item is matched the same way hifi_play matches a single query: set `artist` on an item whenever it is known (matched by identity, not word overlap) and `kind` ('track' or 'album') when known. An item with no confident match is skipped and reported as not found; it does not fail the rest of the list. A list over 50 items is truncated to the first 50 rather than refused — the reply's `summary` says so plainly when it happens. Only the first several items of a long list are confirmed before this call returns; any remainder keeps queuing in the background afterwards and is NOT yet confirmed — the `summary` says exactly how many are still in flight when this happens, for example '5 of 15 queued so far; 10 more queuing now in the background, not yet confirmed.' Report whatever the summary says plainly, including an in-flight remainder — never claim or imply the rest has already queued."
 )]
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 pub struct HifiPlayManyTool {
@@ -951,7 +952,7 @@ pub async fn handle_play(
 /// those providers — the honest distinction #392's rule 3 draws.
 pub async fn handle_play_many(
     state: &AppState,
-    args: HifiPlayManyTool,
+    mut args: HifiPlayManyTool,
 ) -> Result<CallToolResult, CallToolError> {
     let target = ZoneTarget::classify(&args.zone_id);
     let route = target.for_library();
@@ -980,60 +981,217 @@ pub async fn handle_play_many(
         return env.failed("hifi_play_many: items must not be empty.");
     }
 
+    // A hard outer ceiling, independent of the sync/background split below -
+    // 50 comfortably covers even "build two hours of party music" (roughly
+    // 30-40 average-length tracks) while still bounding a truly absurd ask.
+    // A longer request is truncated to this cap rather than refused outright
+    // - the caller still gets a usable queue instead of nothing, and the
+    // summary says plainly that it was cut down, so nothing is silently
+    // dropped.
+    const MAX_PLAY_MANY_ITEMS: usize = 50;
+    let requested_count = args.items.len();
+    let truncated = requested_count > MAX_PLAY_MANY_ITEMS;
+    if truncated {
+        args.items.truncate(MAX_PLAY_MANY_ITEMS);
+    }
+
     use crate::adapters::roon::{PlayAction, PlayKind, SearchSource};
 
     let first_action = PlayAction::parse(args.action.as_deref().unwrap_or("play"));
     let total = args.items.len();
-    let mut queued = Vec::with_capacity(total);
-    let mut ok_count = 0usize;
-    let mut not_found = Vec::new();
 
-    for (i, item) in args.items.iter().enumerate() {
-        // Every item after the first is always queued: playing several "play"
-        // actions in a row would each restart playback from that item, which
-        // is never what a curated list means.
-        let action = if i == 0 {
-            first_action
-        } else {
-            PlayAction::Queue
-        };
-        let kind = match item.kind.as_deref() {
+    fn kind_of(item: &HifiPlayManyItem) -> PlayKind {
+        match item.kind.as_deref() {
             Some("track" | "song") => PlayKind::Track,
             Some("album") => PlayKind::Album,
             _ => PlayKind::Auto,
-        };
-        match state
-            .roon
-            .search_and_play_kind(
-                &item.query,
-                &args.zone_id,
-                SearchSource::Library,
-                action,
-                kind,
-                item.artist.as_deref(),
-            )
-            .await
-        {
-            Ok(message) => {
-                ok_count += 1;
-                queued.push(McpPlayManyItemResult {
-                    query: item.query.clone(),
-                    outcome: "ok",
-                    message,
-                });
-            }
-            Err(e) => {
-                not_found.push(item.query.clone());
-                queued.push(McpPlayManyItemResult {
-                    query: item.query.clone(),
-                    outcome: "error",
-                    message: e.to_string(),
-                });
-            }
         }
     }
 
-    let summary = if not_found.is_empty() {
+    async fn run_one(
+        state: &AppState,
+        zone_id: &str,
+        item: &HifiPlayManyItem,
+        action: PlayAction,
+    ) -> McpPlayManyItemResult {
+        // A per-item timeout well under Roon's own BROWSE_TIMEOUT (10s) -
+        // some titles are genuinely slow to resolve regardless of
+        // concurrency (a live test on 9 October saw "Good Times" alone take
+        // close to 10s, likely from having many cover/sample credits to
+        // disambiguate through several browse drill-down levels), and
+        // because the caller preserves input order, one such item can drag
+        // the whole batch's wall time toward it even with everything else
+        // bounded and fast. Timing out here is reported the same honest way
+        // as a genuine non-match, not as a hard failure.
+        const PLAY_MANY_ITEM_TIMEOUT: Duration = Duration::from_secs(4);
+        match tokio::time::timeout(
+            PLAY_MANY_ITEM_TIMEOUT,
+            state.roon.search_and_play_kind(
+                &item.query,
+                zone_id,
+                SearchSource::Library,
+                action,
+                kind_of(item),
+                item.artist.as_deref(),
+            ),
+        )
+        .await
+        {
+            Ok(Ok(message)) => McpPlayManyItemResult {
+                query: item.query.clone(),
+                outcome: "ok",
+                message,
+            },
+            Ok(Err(e)) => McpPlayManyItemResult {
+                query: item.query.clone(),
+                outcome: "error",
+                message: e.to_string(),
+            },
+            Err(_) => McpPlayManyItemResult {
+                query: item.query.clone(),
+                outcome: "error",
+                message: format!(
+                    "No match within {}s (a slow or heavily contended title)",
+                    PLAY_MANY_ITEM_TIMEOUT.as_secs()
+                ),
+            },
+        }
+    }
+
+    // Item 0 must land before any of the rest: its action (typically "play")
+    // is what resets/establishes the queue in the first place, so a "queue"
+    // call racing ahead of it could get wiped out or land in a nonsensical
+    // position. Every item after it is always queued regardless of
+    // `action` - a list of several tracks can never each restart playback.
+    //
+    // Everything after item 0 runs with bounded concurrency, not one at a
+    // time and not all at once - both extremes were tried live (9 October)
+    // and both failed. Fully sequential: 15 items took 28.70s, timing out
+    // HA's own hard, non-configurable 10s MCP tool-call limit
+    // (components/mcp/coordinator.py TIMEOUT=10) - the second retry's fresh
+    // "play" on item 0 audibly restarted the first track, and the agent
+    // gave up and fell back to a generic hifi_play call entirely. Fully
+    // concurrent (all 14 remaining items at once): dropped to 11.81s, but
+    // two of them came back "Browse request timed out" - Roon's own
+    // adapter-side BROWSE_TIMEOUT (also 10s) - that do not happen when the
+    // same items run a few at a time; Roon's Core (or this adapter's single
+    // browse session) cannot actually service that much concurrency
+    // cleanly. `buffered` (not `buffer_unordered`) keeps at most
+    // PLAY_MANY_CONCURRENCY futures in flight at once while preserving
+    // input order in the output, so the reported summary and the
+    // queued-list are still in request order regardless of completion
+    // order.
+    const PLAY_MANY_CONCURRENCY: usize = 4;
+
+    // Even with safe concurrency, there's a real wall-clock ceiling on how
+    // much of a list this call can resolve and still report back before
+    // HA's own 10s limit (above) runs out - a long list (e.g. "build two
+    // hours of party music", 30-40 tracks) cannot fit inside that ceiling
+    // no matter how this loop is tuned. Only the first SYNC_ITEM_WINDOW
+    // items (including item 0) are resolved synchronously, inside this
+    // call, and reported on honestly. Anything past that is handed to a
+    // detached background task (below): playback and queueing continue
+    // after this call has already returned, at the cost of not being able
+    // to report its outcome in this turn - the summary says plainly how
+    // many are still in flight rather than silently going quiet about
+    // them.
+    //
+    // 5 (item 0 + exactly one wave of PLAY_MANY_CONCURRENCY) keeps a
+    // provable worst case: item 0's own call is capped at
+    // PLAY_MANY_ITEM_TIMEOUT (4s, see run_one above), and the remaining 4
+    // run as a single wave under the same per-item cap, so the whole sync
+    // group cannot exceed roughly 2 * PLAY_MANY_ITEM_TIMEOUT = 8s even if
+    // every single one of them were maximally slow - comfortably under
+    // both HA's and Roon's own 10s ceilings. A larger window (8 was tried
+    // first) can't give this guarantee: 7 items at concurrency 4 need two
+    // waves, pushing the provable worst case to 12s, over budget - and a
+    // live test the same day hit close to that exact case for real
+    // ("Good Times" alone took near Roon's own BROWSE_TIMEOUT).
+    const SYNC_ITEM_WINDOW: usize = 5;
+
+    use futures::StreamExt;
+
+    let sync_end = total.min(SYNC_ITEM_WINDOW);
+    let background_items: Vec<HifiPlayManyItem> = if total > sync_end {
+        args.items[sync_end..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    let mut queued = Vec::with_capacity(sync_end);
+    let mut ok_count = 0usize;
+    let mut not_found = Vec::new();
+
+    if let Some(first) = args.items.first() {
+        queued.push(run_one(state, &args.zone_id, first, first_action).await);
+    }
+    if sync_end > 1 {
+        let futs: Vec<_> = args.items[1..sync_end]
+            .iter()
+            .map(|item| run_one(state, &args.zone_id, item, PlayAction::Queue))
+            .collect();
+        let rest = futures::stream::iter(futs)
+            .buffered(PLAY_MANY_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        queued.extend(rest);
+    }
+    for result in &queued {
+        if result.outcome == "ok" {
+            ok_count += 1;
+        } else {
+            not_found.push(result.query.clone());
+        }
+    }
+
+    let background_count = background_items.len();
+    if background_count > 0 {
+        let bg_state = state.clone();
+        let bg_zone_id = args.zone_id.clone();
+        tokio::spawn(async move {
+            let futs: Vec<_> = background_items
+                .iter()
+                .map(|item| run_one(&bg_state, &bg_zone_id, item, PlayAction::Queue))
+                .collect();
+            let results = futures::stream::iter(futs)
+                .buffered(PLAY_MANY_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            let ok = results.iter().filter(|r| r.outcome == "ok").count();
+            let missed: Vec<&str> = results
+                .iter()
+                .filter(|r| r.outcome != "ok")
+                .map(|r| r.query.as_str())
+                .collect();
+            if missed.is_empty() {
+                tracing::info!(
+                    "hifi_play_many background batch for {bg_zone_id}: {ok} of {background_count} queued"
+                );
+            } else {
+                tracing::warn!(
+                    "hifi_play_many background batch for {bg_zone_id}: {ok} of {background_count} \
+                     queued; not found: {}",
+                    missed.join(", ")
+                );
+            }
+        });
+    }
+
+    let mut summary = if background_count > 0 {
+        if not_found.is_empty() {
+            format!(
+                "{ok_count} of {total} queued so far; {background_count} more queuing now in \
+                 the background, not yet confirmed."
+            )
+        } else {
+            format!(
+                "{ok_count} of {total} queued so far; {} not found: {}; {background_count} more \
+                 queuing now in the background, not yet confirmed.",
+                not_found.len(),
+                not_found.join(", ")
+            )
+        }
+    } else if not_found.is_empty() {
         format!("{ok_count} of {total} queued.")
     } else {
         format!(
@@ -1042,6 +1200,12 @@ pub async fn handle_play_many(
             not_found.join(", ")
         )
     };
+    if truncated {
+        summary.push_str(&format!(
+            " {requested_count} were requested; capped at {MAX_PLAY_MANY_ITEMS} per call, \
+             the rest were not sent."
+        ));
+    }
 
     let observed = Observed::from_aggregator(state, &args.zone_id).await;
     Ok(env

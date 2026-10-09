@@ -1590,6 +1590,41 @@ async fn play_many_refuses_an_empty_item_list() {
 }
 
 #[tokio::test]
+async fn play_many_truncates_a_list_over_the_item_cap_with_a_note() {
+    let core = FakeRoonCore::start_with(mock_servers::roon_core::FakeLibrary::standard()).await;
+    let adapter = connected_roon(&core).await;
+    let state = app_state_with_roon(adapter).await;
+
+    let items: Vec<_> = (0..51).map(|i| play_many_item(&format!("Track {i}"))).collect();
+    let result = handle_play_many(&state, play_many_args("roon:zone_fake_1", items)).await;
+
+    assert_eq!(
+        outcome_of(&result),
+        "accepted",
+        "51 items is one over the 50 cap, but the request still runs, truncated -- a \
+         caller asking for a long list (e.g. two hours of party music) should get a \
+         usable queue, not nothing: {}",
+        text_of(&result)
+    );
+    let data = structured_of(&result)["data"].clone();
+    let queued = data["queued"].as_array().expect("queued must be an array");
+    assert_eq!(
+        queued.len(),
+        5,
+        "only the sync window (5 items) is confirmed in this call, even within a capped list"
+    );
+    let summary = data["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("51 were requested; capped at 50 per call"),
+        "summary must say plainly that the list was cut down, got {summary:?}"
+    );
+    assert!(
+        summary.contains("45 more queuing now in the background"),
+        "summary must say plainly how many of the (capped) 50 are still in flight, got {summary:?}"
+    );
+}
+
+#[tokio::test]
 async fn play_many_refuses_a_non_roon_zone_as_not_yet_implemented() {
     let core = FakeRoonCore::start_with(mock_servers::roon_core::FakeLibrary::standard()).await;
     let adapter = connected_roon(&core).await;
